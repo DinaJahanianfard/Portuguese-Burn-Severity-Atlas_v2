@@ -1,0 +1,1774 @@
+//.........................................................................................//
+//                                                                                         //
+//                                                                                         //
+//                              "General info about the code"                              //
+//                                                                                         //
+//                                                                                         //
+//.........................................................................................//
+//This code aims to process satellite images from different sensors and calculate different burn severity indices for fires which burned from 1984 to 2022 in Portugal. 
+//Based on the year in which the fires burnt and the availibility of satellite imgery, different sensors have been used: 
+    //for fires which burnt from 1984 to 2001 and 2003 to 2011: satellite images from LANDSAT 5 - dataset in GEE: 'LANDSAT/LT05/C02/T1_L2'
+    //for fires which burnt in 2002: satellite images from LANDSAT 7 - dataset in GEE: 'LANDSAT/LE07/C02/T1_L2'
+    //for fires which burnt in 2012: satellite images from MODIS(500m) - dataset in GEE: 'MODIS/006/MOD09A1'
+    //for fires which burnt from 2013 to 2022: satellite images from LANDSAT 8 - dataset in GEE: 'LANDSAT/LC08/C02/T1_L2.
+//The fire data- perimeter/bound, start/end date, area, year of burning- have been imported into GEE as assests and have been used as tables: 
+    //table: containing fires which burnt from 2001 to 2022 - uncomment if the assets are not loaded
+  //var table = ee.FeatureCollection('users/dinaj/Fires_2001to2022_V5'); // shared at : https://code.earthengine.google.com/?asset=users/dinaj/Fires_2001to2022_V5
+    //table2: containing fires which burnt from 1984 to 2000 - uncomment if the assets are not loaded
+  // var table2 = ee.FeatureCollection('projects/the-name-367619/assets/Wildire_Perimeters_Dates_1984_2000_V5'); //shared at: https://code.earthengine.google.com/?asset=projects/the-name-367619/assets/Wildire_Perimeters_Dates_1984_2000_V5
+//To increase the efficiency of GEE, to perform each type of processing, different functions have been created and will be used inside the loops. 
+//The severity indices calculated within this code are as following: 
+    // NBR: Normalized Burn Ratio 
+    // dNBR: difference Normalized Burn Ratio 
+    // RdNBR: Relative difference of Normalized Burn Ratio 
+    // RBR : Relative Burn Ratio
+    // dNBR-EVI: difference Normalized Burn Ration- Enhanced Vegitation Index 
+
+//After running the code, it is highly likely that the browser freezes up and you will be given the choice of closing the browser or waiting. You should choose "waiting option" for GEE to be come responsive again. Do not press "Exit". 
+//When the processing is done, the browser will unfreeze. 
+//When you want to export any of the proceesed maps or details about the maps, uncomment the export section written for that specific index.
+//In the case of getting the error "API keys are not supported by this API. Expected OAuth2 access token or other authentication credentials that assert a principal", execute the code with smaller number of i. 
+//In case of getting the error "Earth Engine memory capacity exceeded." rerun the code especially for i for which the error was received. 
+
+//This code is developed by Dina Jahanianfard, ULisboa. 
+//This code can only be used after the publication/citation of the manuscript entitled:"Multidecadal satellite-derived Portuguese Burn Severity Atlas (1984 -2022) ", written by Jahanianfard.D, et al (2024). 
+//.........................................................................................//
+//                                                                                         //
+//                                                                                         //
+//                              "Variables to be filled"                                   //
+//                                                                                         //
+//                                                                                         //
+//.........................................................................................//
+// variables which will be used in functions but are either obtained or calculated through loops below. 
+var start,end,region,area,area_original,x;
+var con1, con2, preNBR, postNBR, dNBR, preArea, postArea, dNBRArea,fire,onlybuffer;
+var Scale_all = ee.Algorithms.If(year === 2012, 500, 30);//defining the scale if MODIS is being used, then 500 and not the scale be 30
+Scale_all = ee.Number(Scale_all).getInfo(); //object type should be number from computed object
+
+//******************************************************************************************
+
+//.........................................................................................//
+//                                                                                         //
+//                                                                                         //
+//                                     "FUNCTIONS"                                         //
+//                                                                                         //
+//                                                                                         //
+//.........................................................................................//
+//rescaling LANDSAT images for calculations and visualization 
+function rescale(image) {
+  var opticalBands = image.select('SR_B.').multiply(0.0000275).add(-0.2); //rescaling optical bands 
+  var thermalBand = image.select('ST_B.*').multiply(0.00341802).add(149.0); //rescaling thermal bands 
+  return image.addBands(opticalBands, null, true)
+      .addBands(thermalBand, null, true);
+}
+//masking shadows, Cirrus, and clouds
+function maskClouds(image) {
+  var qa,mask;
+  if(year===2012){
+    qa = image.select('StateQA'); //quality band of MODIS
+    var cloudState = qa.bitwiseAnd(1 << 0).eq(0);  // Clouds
+    var cloudShadowState = qa.bitwiseAnd(1 << 2).eq(0);  // Cloud shadows
+    var cirrusState = qa.bitwiseAnd(1 << 8).eq(0);  // Cirrus
+    mask = cloudState.and(cloudShadowState).and(cirrusState);// Combine masks into one
+  } else if(year!=2012){
+    qa = image.select('QA_PIXEL'); //quality band of LANDSAT
+    var cloud = qa.bitwiseAnd(parseInt('11111', 2)).eq(0); //cloud
+    var cirrus = qa.bitwiseAnd(parseInt('1000', 2)).eq(0); //cirrus
+    var shadow = qa.bitwiseAnd(parseInt('100', 2)).neq(0); //shadow
+    var shadowBuffer = shadow.focal_max({radius: 50, units: 'meters', kernelType: 'circle', iterations: 1});
+    mask = cloud.and(cirrus).and(shadowBuffer.not()); //combining the masks
+  }
+  return image.updateMask(mask);
+}
+//calculating the area in ha of any region 
+function areaCalculate(image){
+  image = ee.Image(image);
+  var bandNames = image.bandNames(); //getting the band names of this image
+  var firstBand = ee.Image(image).select(ee.List([0]).cat(bandNames.slice(1))); //selecting only one band of image
+  var S;
+  var image_pixel;
+  if (year!=2012){
+    image_pixel = firstBand.reduceRegion({ //via this reducer, the pixel counts covering BAs is obtained
+      reducer: ee.Reducer.count(),
+      geometry: region,
+      maxPixels: 1e13,
+      scale: 30, //landsat resolution = 30m 
+      crs: "EPSG:32629"
+      }); //counting the pixels of that one band 
+      S = ee.Number(image_pixel.get(bandNames.get(0))).multiply(0.09).round(); //multiplying the pixel count by Landsat resolution (30m) to get the area in ha
+  } else if (year===2012) {
+    image_pixel = firstBand.reduceRegion({ //via this reducer, the pixel counts covering BAs is obtained
+      reducer: ee.Reducer.count(),
+      geometry: region,
+      maxPixels: 1e13,
+      scale: 500, //MODIS resolution = 500m 
+      crs: "EPSG:32629"
+      }); //counting the pixels of that one band 
+    S = ee.Number(image_pixel.get(bandNames.get(0))).multiply(25).round(); //multiplying the pixel count by by MODIS resolution (500m) to get the area in ha (due to high resolution under/over estimation of the area may occur)
+    }
+  return S;
+}
+//creating properties in image meta data of pre-fire images 
+function new_properties_pre (ic){
+  var dates_images,date_imageT; //variables to get the dates either from MODIS or LANDSAT 
+  var fire_area = area; //original area of the fire reported in the shapefile (Tables)
+  // TIMELAG : 
+  if ( year!=2012 ){
+    dates_images = ee.ImageCollection(ic).aggregate_first("DATE_ACQUIRED"); //getting the acqusition date of image (MODIS)
+    date_imageT = ee.Date(dates_images); //converting to readable date by GEE
+  } else if (year===2012){
+    dates_images= ee.ImageCollection(ic).aggregate_first("system:index"); //getting the acqusition date of image (Landsat)
+    date_imageT = ee.Date.parse('yyyy_MM_dd',dates_images, 'GMT'); //converting to readable date by GEE
+  }
+  var dateImage = ee.Array(date_imageT.millis()); //converting the acqusition date of image into milliseconds 
+  var start_array = ee.Array(start.millis()); //  converting the start date of the fire to milliseconds (start will be taken from the shapefile)
+  var diff_Fire_Image = ee.Number(dateImage).subtract(ee.Number(start_array));  //subtracting the start date of fire from the acqusition date of image (=time lag or TL)
+  var diff2date = diff_Fire_Image.divide(86400000).int(); //converting TL from milliseconds to integer number 
+  //CLOUDs
+  var cloudless_img = ee.ImageCollection(ic).map(maskClouds).first().clip(region); // getting each image, applying cloud mask and clipping it to AOI
+  var cloudless_img_pixel_count = areaCalculate(cloudless_img); //getting the size in ha of clipped cloudfree image
+  var img_full = ee.ImageCollection(ic).first().clip(region); // getting each image and clipping it to AOI 
+  var img_pixel_count = areaCalculate(img_full); //getting the size in ha of clipped image (with cloud)
+  //CLOUD_COVERAGE_AOI
+  var cloud_percentage_aoi = (ee.Number(1).subtract(cloudless_img_pixel_count.divide(img_pixel_count)).multiply(100)).round(); //getting the percentage of cloud within the AOI
+  //IMAGE_COVERAGE_PERCENTAGE 
+  var image_covereage = ((img_pixel_count.divide(fire_area)).multiply(100)).round(); //percentage of image actually covering the AOI 
+  return ic.set({'TIMELAG':diff2date,'CLOUD_COVERAGE_AOI': cloud_percentage_aoi,'IMAGE_COVERAGE_PERCENTAGE':image_covereage}); //inserting the new properties into meta data of the pre-fire image collection
+}
+//creating properties in image meta data of post-fire images 
+function new_properties_post (ic){
+  var dates_images,date_imageT;//variables to get the dates either from MODIS or LANDSAT 
+  var fire_area = area;//original area of the fire reported in the shapefile (Tables)
+  //TIMELAG
+  if ( year!=2012 ){
+    dates_images = ee.ImageCollection(ic).aggregate_first("DATE_ACQUIRED"); //getting the acqusition date of image (MODIS)
+    date_imageT = ee.Date(dates_images); //converting to readable date by GEE
+  } else if (year===2012){
+    dates_images= ee.ImageCollection(ic).aggregate_first("system:index"); //getting the acqusition date of image (Landsat)
+    date_imageT = ee.Date.parse('yyyy_MM_dd',dates_images, 'GMT'); //converting to readable date by GEE
+  }
+  //TIMELAG
+  var dateImage = ee.Array(date_imageT.millis()); //converting the acqusition date of image into milliseconds 
+  var end_array = ee.Array(end.millis());//converting the end date of the fire to milliseconds(end will be taken from the shapefile)
+  var diff_Fire_Image = ee.Number(dateImage).subtract(ee.Number(end_array)); //subtracting the end date of fire from the acqusition date of image (=time lag or TL)
+  var diff2date = diff_Fire_Image.divide(86400000).int();//converting TL from milliseconds to integer number 
+  //CLOUDS
+  var cloudless_img = ee.ImageCollection(ic).map(maskClouds).first().clip(region);// getting each image, applying cloud mask and clipping it to AOI
+  var cloudless_img_pixel_count = areaCalculate(cloudless_img);//getting the size in ha of clipped cloudfree image
+  var img_full = ee.ImageCollection(ic).first().clip(region);// getting each image and clipping it to AOI 
+  var img_pixel_count = areaCalculate(img_full);//getting the size in ha of clipped image (with cloud)
+  //CLOUD_COVERAGE_AOI
+  var cloud_percentage_aoi = (ee.Number(1).subtract(cloudless_img_pixel_count.divide(img_pixel_count)).multiply(100)).round();//getting the percentage of cloud within the AOI
+  //IMAGE_COVERAGE_PERCENTAGE 
+  var image_covereage = ((img_pixel_count.divide(fire_area)).multiply(100)).round();//percentage of image actually covering the AOI 
+  return ic.set({'TIMELAG':diff2date,'CLOUD_COVERAGE_AOI': cloud_percentage_aoi,'IMAGE_COVERAGE_PERCENTAGE':image_covereage});//inserting the new properties into meta data of the pre-fire image collection
+}
+//suitability scale used in suitability function - adding suitabilit as a property to image meta data 
+var scale = ee.Number(0.009);
+function suitability_img (img){
+  var imgTL_prop = ee.ImageCollection(img).aggregate_first("TIMELAG");  //getting the timelag of each image (compared to strat and/or end date of the fire)
+  var positive = ee.Array(imgTL_prop); //converting the image timelag to array to perform further calculations
+  var TL_pos = ee.Number(positive).abs().multiply(scale);  // converting the TL into absolute array and then multiplying the scale
+  var TL_Suit = ee.Number(1).subtract(TL_pos); //subtract the scaled timelag from 1 (so suitability be from 0 to 1)
+  return img.set({'SUITABILITY':TL_Suit.multiply(100)}); //adding 'suitability' (as a percentage) as a property to image meta data
+}
+//renaming the images bands--> all images having smae names for their band to facilate the calculations
+function renameBands (image) {
+  var bands;
+  if (year <= 2011){
+    bands = ['SR_B4', 'SR_B7','SR_B3','SR_B1']; //getting the neesed bands from LANDSAT5 (SWIR & NIR & RED & BLUE bands)
+  } else if (year===2012){
+    bands = ['sur_refl_b02', 'sur_refl_b07','sur_refl_b01','sur_refl_b03']; //getting the neesed bands from MODIS (SWIR & NIR & RED & BLUE bands)
+  } else if (year>=2013){
+      bands = ['SR_B5', 'SR_B7','SR_B4','SR_B2']; //getting the neesed bands from LANDSAT8 (SWIR & NIR & RED & BLUE bands)
+    }
+    var new_bands = ['NIR', 'SWIR','RED','BLUE']; 
+    return image.select(bands).rename(new_bands); //renaming bands to SWIR & NIR & RED & BLUE bands
+}
+// creating new region for pre-fire whenever there is a cloud --> needed for defining the iteration conditions
+function newRegionPre(collection){
+  collection = ee.ImageCollection(collection).map(new_properties_pre).map(suitability_img); //for any image in the collection, there is a 'TIMELAG','CLOUD_COVERAGE_AOI','IMAGE_COVERAGE_PERCENTAGE', and 'SUITABILITY'
+  collection = collection.filterMetadata('IMAGE_COVERAGE_PERCENTAGE','greater_than',80); //only images which cover 80% of AOI
+  collection = collection.sort("SUITABILITY",false); //sorting the images based on their suitability from the image with highest suitability to image with least suitability
+  var image = collection.first().clip(region); //clipping the image to AOIL (image with cloud)
+  image= renameBands(image); //rename image bands to NIR&SWIR
+  image = (image.select('NIR')).toInt(); //converting the NIR band to integer 
+  var image1 = collection.map(maskClouds).first().clip(region); // clip image to AOI and apply cloud mask 
+  image1= renameBands(image1); //rename cloudless clipped image bands to NIR&SWIR
+  image1 = (image1.select('NIR')).toInt(); //select NIR band of cloudless image and co9nvert it to integer 
+  var polygon = image.reduceToVectors({ //convert the image (with no cloud mask) to a polygon
+    reducer: ee.Reducer.countEvery(),  //counting pixels 
+    geometry: region, 
+    scale: Scale_all, 
+    maxPixels: 1e13 
+  }).geometry();
+  var polygon1 = image1.reduceToVectors({ //convert the cloudless image to a polygon
+    reducer: ee.Reducer.countEvery(), //counting pixels 
+    geometry: region, 
+    scale: Scale_all, 
+    maxPixels: 1e13 
+  }).geometry();
+  polygon1 = polygon1.buffer(10);  //apply a 10m buffer so the boarders get neglected
+  var difference = polygon.difference(polygon1, ee.ErrorMargin(1)); //create a new area based on the cloud cover within the AOI
+  var remainingArea = ee.FeatureCollection(difference).geometry(); //convert the new AOI (caused by cloud) into a geometry
+  return  remainingArea; 
+}
+// creating new region for post-fire whenever there is a cloud --> needed for defining the iteration conditions
+function newRegionPost(collection){
+  collection = ee.ImageCollection(collection).map(new_properties_post).map(suitability_img); //for any image in the collection, there is a 'TIMELAG','CLOUD_COVERAGE_AOI','IMAGE_COVERAGE_PERCENTAGE', and 'SUITABILITY'
+  collection = collection.filterMetadata('IMAGE_COVERAGE_PERCENTAGE','greater_than',80); //only images which cover 80% of AOI
+  collection = collection.sort("SUITABILITY",false); //sorting the images based on their suitability from the image with highest suitability to image with least suitability
+  var image = collection.first().clip(region); //clipping the image to AOIL (image with cloud)
+  image= renameBands(image); //rename image bands to NIR&SWIR
+  image = (image.select('NIR')).toInt(); //converting the NIR band to integer 
+  var image1 = collection.map(maskClouds).first().clip(region); // clip image to AOI and apply cloud mask 
+  image1= renameBands(image1); //rename cloudless clipped image bands to NIR&SWIR
+  image1 = (image1.select('NIR')).toInt(); //select NIR band of cloudless image and co9nvert it to integer 
+  var polygon = image.reduceToVectors({ //convert the image (with no cloud mask) to a polygon
+    reducer: ee.Reducer.countEvery(), //counting pixels 
+    geometry: region, 
+    scale: Scale_all, 
+    maxPixels: 1e13 
+  }).geometry();
+  var polygon1 = image1.reduceToVectors({ //convert the cloudless image to a polygon
+    reducer: ee.Reducer.countEvery(), //counting pixels 
+    geometry: region, 
+    scale: Scale_all, 
+    maxPixels: 1e13 
+  }).geometry();
+  polygon1 = polygon1.buffer(10);  //apply a 10m buffer so the boarders get neglected
+  var difference = polygon.difference(polygon1, ee.ErrorMargin(1)); //create a new area based on the cloud cover within the AOI
+  var remainingArea = ee.FeatureCollection(difference).geometry(); //convert the new AOI (caused by cloud) into a geometry
+  return  remainingArea; 
+}
+//calculation of dNBR based on any input pre & post NBR
+function dNBR_cal (imgPre,imgPost){
+  var dNBR = imgPre.subtract(imgPost); //subtracting any pre-fire NBR from any post-fire NBR
+  // var dNBR1 = dNBR.clip(region)
+  var dNBR_area = areaCalculate(dNBR); //carlulate the area of the dNBR estimation in ha
+  var confidence = ((ee.Number(imgPre.get('SUITABILITY')).add(ee.Number(imgPost.get('SUITABILITY')))).divide(2)).round(); //getting the confidence in estimated dNBR based on suitability of pre & post NBR 
+  dNBR = dNBR.set({ //adding the pre & post properties into the dNBR metadata 
+    'SUITABILITY_PRE': imgPre.get('SUITABILITY'),
+    'TIMELAG_PRE' : imgPre.get('TIMELAG'),
+    'CLOUD_COVERAGE_AOI_PRE' : imgPre.get('CLOUD_COVERAGE_AOI'), 
+    'SUITABILITY_POST': imgPost.get('SUITABILITY'), 
+    'TIMELAG_POST' : imgPost.get('TIMELAG'),
+    'CLOUD_COVERAGE_AOI_POST': imgPost.get('CLOUD_COVERAGE_AOI'), 
+    'CONFIDENCE': confidence, 
+    'AREA':dNBR_area
+  });
+  return dNBR.rename('dNBR'); //the output band name===dNBR
+}
+//calculating the RdNBR based on any input dNBR and pre-fire NBR
+function RdNBR_cal (pre_Fire_NBR, Fire_dNBR){
+  Fire_dNBR = ee.Image(Fire_dNBR); //making sure that the dNBR input is an image (GEE optimization )
+  var imgPreNoZero = pre_Fire_NBR.where(pre_Fire_NBR.eq(0), 0.001); // finding any pixel in pre-fire NBR with value equal to zero and converting that zero into 0.001 to prevent the ocuurance of infinity in calculations
+  imgPreNoZero = imgPreNoZero.abs(); //converting the pre-fire NBR to only positive values (ranging from 0.001 to 1)
+  imgPreNoZero = imgPreNoZero.sqrt(); //geeting the square root of pre-fire NBR
+  imgPreNoZero = ee.Image(imgPreNoZero); //convert the processed pre-fire NBR into an image (GEE optimization )
+  var RdNBR = Fire_dNBR.divide(imgPreNoZero); //divide the dNBR to processed pre-fire NBR 
+  return RdNBR.rename('RdNBR'); //the output band name===RdNBR
+}
+//calculating the confidence raster of dNBR based on any input dNBR 
+function confidence_cal (dNBR){
+  var image = (ee.Image(dNBR).select('dNBR')).toInt(); //convert the NBR band to integer 
+  var feature = image.reduceToVectors({ //convert the integer dNBR into a vector 
+    geometry: region,
+    scale: Scale_all,
+    maxPixels: 1e13,
+  });
+  var confidence_main = ee.Number(dNBR.get('CONFIDENCE')); //get the confidence of input dNBR
+  var dNBR_confidence = ee.Image.constant(confidence_main).toInt().clip(feature); //create a constant image based on the confidence of input dNBR and clip it to the vector of it 
+  return dNBR_confidence.toInt8().rename('dNBR_confidence'); // have a signed 8-bit integer raster file with each pixel having the value of the input dNBR confidence & the output band name===dNBR_confidence
+}
+//calculating the dNBR-EVI index 
+function dNBR_EVI_cal(collection,j,dNBR){
+  collection = ee.ImageCollection(collection).map(new_properties_post).map(suitability_img); //for any image in the post-fire collection, there is a 'TIMELAG','CLOUD_COVERAGE_AOI','IMAGE_COVERAGE_PERCENTAGE', and 'SUITABILITY'
+  collection = collection.filterMetadata('IMAGE_COVERAGE_PERCENTAGE','greater_than',80);//only images which cover 80% of AOI
+  collection = collection.filterMetadata('CLOUD_COVERAGE_AOI','less_than',90);//only images which cloud contamination less than 90% (at leat 5% of AOI is cloudfree)
+  var sorted_collection = collection.sort("SUITABILITY",false); //sorting the images based on their suitability from the image with highest suitability to image with least suitability
+  var sorted_list = sorted_collection.toList(sorted_collection.size()); //convert the image collection into a list 
+  var img1 = ee.Image(sorted_list.get(j)); //getting the jth element of the list 
+  img1 = maskClouds(img1).clip(region); // clip image to AOI and apply cloud mask 
+  img1 = renameBands(img1); 
+  var NIR = img1.select('NIR'); //getting the NIR band of post image 
+  var RED = img1.select('RED'); //getting the RED band of post image
+  var BLUE = img1.select('BLUE'); //getting the BLUE band of post image
+  //calculating the EVI index of post-fire image based on NIR, RED, and blue band 
+  var EVI_post = NIR.subtract(RED)
+                .divide(NIR.add(RED.multiply(6)).subtract(BLUE.multiply(7.5)).add(1))
+                .multiply(2.5);
+  //calculating the dNBR_EVI index
+  var dNBR_EVI = dNBR.add(EVI_post);
+  //returning the dNBR-EVI index
+  return  dNBR_EVI.rename('dNBR-EVI'); //the output band name === dNBR_EVI
+}
+//calculating the RBR index
+function RBR_cal (pre_Fire_NBR, Fire_dNBR){
+  Fire_dNBR = ee.Image(Fire_dNBR); //making sure that the dNBR input is an image (GEE optimization )
+  pre_Fire_NBR = ee.Image(pre_Fire_NBR); //making sure that the preNBR input is an image (GEE optimization )
+  var RBR = Fire_dNBR.divide(pre_Fire_NBR.add(1.001)); //dividing dNBR by the preNBR+ 1.001 (value by the creators of RBR)
+  return RBR.rename('RBR'); //the output band name===RBR
+}
+//getting the condition for iterations based on area of the fire (area), area of pre-fire NBR (preArea),area of post-fire NBR(postArea), and area of estimated dNBR (dNBRArea) (all in ha)
+function getCombinedCondition(area, preArea, postArea, dNBRArea) {
+  var dif_area = ee.Number(area).subtract(ee.Number(dNBRArea));//getting the difference between the area of fire and area of estimated dNBR
+  var condition = dif_area.gte(70); //check whether this difference(area-dNBRArea) is equal or larger than 70ha 
+  var diff_pre = ee.Number(area).subtract(ee.Number(preArea)); // getting the difference between the area of the fire and area with pre-fire NBR
+  var condition2 = (preArea.lt(area)).and(diff_pre.gte(70)); //check whether this difference(area-preArea) is equal or larger than 70ha 
+  var diff_post = ee.Number(area).subtract(ee.Number(postArea));// getting the difference between the area of the fire and area with post-fire NBR
+  var condition3 = (postArea.lt(area)).and(diff_post.gte(70));//check whether this difference(area-postArea) is equal or larger than 70ha 
+  var condition4_1 = condition2.and(condition3); //if both the difference of area and pre-fire NBR and post-fire NBR is larger than 70ha
+  var errorMargin = 1; //max error tolerated 
+  var AOI = ee.Feature(ee.Algorithms.If(condition2, newRegionPre(CollectionPre), ee.Feature(null))); //if the difference of preArea and area is larger than 70ha --> create a new region for pre 
+  var AOI1 = ee.Feature(ee.Algorithms.If(condition3, newRegionPost(CollectionPost), ee.Feature(null)));//if the difference of postArea and area is larger than 70ha --> create a new region for pre
+  var AOI_coor = ee.Feature(AOI).geometry().coordinates().length(); //checking that AOI exist (there is cloud) or not
+  var AOI1_coor = ee.Feature(AOI1).geometry().coordinates().length();//checking that AOI1 exist (there is cloud) or not
+  var AOI_coor1 = AOI_coor.eq(0); //the ref pre image does not cover the area and not covering due to cloud contamination 
+  var AOI1_coor1 = AOI1_coor.eq(0); //the ref post image does not cover the area and not covering due to cloud contamination 
+  var condition_5 = AOI_coor1.and(AOI1_coor1); //because of the cloud there is no pre/post NBR and not the images being contaminated with clouds 
+  condition_5 = condition_5.and(condition);
+  var intersect = AOI.intersects(AOI1, errorMargin); // intersecting the new AOIpre and AOIpost with each other 
+  var condition4_2 = ee.Algorithms.If(intersect, ee.Number(0), ee.Number(1)); //if there is an intersection, give number 0 (false to intersection)
+  var condition4_4 = condition.and(condition4_1); // all the differences( differences of area and preArea, postArea, and dNBRArea) is larger than 70ha 
+  var condition4_5 = condition4_4.and(condition4_2); //the differences are larger than 70ha and there is no intersection  --> lacking both pre and post NBR and the area but lacking isnot intersecvting for both pre and post 
+  condition4_5 = condition4_5.and(condition_5.not()); //the lack of area is due to cloud in areas that do not intersect and it is due to cloud contamination 
+  var condition4_6 = ee.Algorithms.If(intersect, ee.Number(1), ee.Number(0)); //if there is any intersection, then give number 1 (true to intersection)
+  var condition4_7 = condition.and(condition4_6); //the difference of area and dNBRArea is larger than 70ha and there is an intersection 
+  var condition4_9 = condition4_7.and(condition4_1); //all the differences are larger than 70 ha and there is an intersection --> lacking both pre and post NBR and the area lacking is intersecvting for both pre and post 
+  condition4_9 = condition4_9.or(condition_5).and(condition4_1); //the area lacking is either due to cloud contamination in the areas that do not intersect or due to image not covering that area that intersected due to image coverage lack in both pre and post fire image 
+  var condition_post = condition.and(condition3).and(condition2.not()).and(condition4_9.not()); //the difference of area and postArea is larger than 70ha and the difference of area and preArea is less than 70ha and there is no intersection --> post condition: lacking only post-fire NBR 
+  var condition_pre = condition.and(condition2).and(condition3.not()).and(condition4_9.not()); //the difference of area and preArea is larger than 70ha and the difference of area and postArea is less than 70ha and there is no intersection  --> pre condition : lacking only pre-fire NBR 
+  var finalCondition = condition.and(condition4_5.or(condition4_9).or(condition_pre).or(condition_post).or(condition_5.not())); //merging all the conditions together
+  //applying names for each conditions, if none of the conditions is applicable, then gives null --> this is done to rename the conditions 
+  var trueCondition4_5 = ee.Algorithms.If(condition4_5, 'not_intersected', null); 
+  var trueCondition4_9 = ee.Algorithms.If(condition4_9, 'intersected', null);
+  var trueCondition_post = ee.Algorithms.If(condition_post, 'post', null);
+  var trueCondition_pre = ee.Algorithms.If(condition_pre, 'pre', null);
+  var trueCondition_no_iteration = ee.Algorithms.If(condition, null, 'not_iteration_needed');
+  //creating the list with condition names
+  var trueConditions = ee.List([
+    trueCondition_no_iteration,
+    trueCondition4_5,
+    trueCondition4_9,
+    trueCondition_post,
+    trueCondition_pre//, 
+    // trueCondition_images
+  ]).filter(ee.Filter.notNull(['item'])); //adding all the conditions into one list and removing if there is a null value 
+  return { //returning the condition and the name of the condition 
+    condition: finalCondition, 
+    trueConditions: trueConditions
+  };
+} 
+//calculating the pre-fire NBR based on each iteration (j can vary from 0 to 2 as the maximum number of iteration is 3) 
+function NBR_cal_pre1(collection,j){
+  collection = ee.ImageCollection(collection).map(new_properties_pre).map(suitability_img); //for any image in the pre-fire collection, there is a 'TIMELAG','CLOUD_COVERAGE_AOI','IMAGE_COVERAGE_PERCENTAGE', and 'SUITABILITY'
+  collection = collection.filterMetadata('IMAGE_COVERAGE_PERCENTAGE','greater_than',80);//only images which cover 80% of AOI
+  collection = collection.filterMetadata('CLOUD_COVERAGE_AOI','less_than',90);//only images which cloud contamination less than 90% (at leat 5% of AOI is cloudfree)
+  var sorted_collection = collection.sort("SUITABILITY",false); //sorting the images based on their suitability from the image with highest suitability to image with least suitability
+  var sorted_list = sorted_collection.toList(sorted_collection.size()); //convert the image collection into a list 
+  var img1 = ee.Image(sorted_list.get(j)); //getting the jth element of the list 
+  img1 = maskClouds(img1).clip(region); // clip image to AOI and apply cloud mask 
+  img1 = renameBands(img1); //rename image bands to NIR&SWIR
+  var NBR = img1.normalizedDifference(['NIR', 'SWIR']).rename('NBR'); //normalize difference (NIR-SWIR/NIR+SWIR) of each image and renaming the band as NBR 
+  var area1 = areaCalculate(NBR); // calculate the area with pre-fire estimation
+  NBR = NBR.set({ // copy the properties of each image to NBR image as well  
+    'SUITABILITY': img1.get('SUITABILITY'),
+    'IMAGE_COVERAGE_PERCENTAGE': img1.get('IMAGE_COVERAGE_PERCENTAGE'),
+    'TIMELAG': img1.get('TIMELAG'), 
+    'CLOUD_COVERAGE_AOI' : img1.get('CLOUD_COVERAGE_AOI'),
+    'Area': area1
+  });
+  return  NBR.set('position', j); //this j will demonestrate the position of the used image in the image collection which is further used for the iteration process
+} 
+//calculating the post-fire NBR based on each iteration (j can vary from 0 to 2 as the maximum number of iteration is 3) 
+function NBR_cal_post1(collection,j){
+  collection = ee.ImageCollection(collection).map(new_properties_post).map(suitability_img); //for any image in the post-fire collection, there is a 'TIMELAG','CLOUD_COVERAGE_AOI','IMAGE_COVERAGE_PERCENTAGE', and 'SUITABILITY'
+  collection = collection.filterMetadata('IMAGE_COVERAGE_PERCENTAGE','greater_than',80);//only images which cover 80% of AOI
+  collection = collection.filterMetadata('CLOUD_COVERAGE_AOI','less_than',90);//only images which cloud contamination less than 90% (at leat 5% of AOI is cloudfree)
+  var sorted_collection = collection.sort("SUITABILITY",false); //sorting the images based on their suitability from the image with highest suitability to image with least suitability
+  var sorted_list = sorted_collection.toList(sorted_collection.size()); //convert the image collection into a list 
+  var img1 = ee.Image(sorted_list.get(j)); //getting the jth element of the list 
+  img1 = maskClouds(img1).clip(region); // clip image to AOI and apply cloud mask 
+  img1 = renameBands(img1); //rename image bands to NIR&SWIR
+  var NBR = img1.normalizedDifference(['NIR', 'SWIR']).rename('NBR'); //normalize difference (NIR-SWIR/NIR+SWIR) of each image and renaming the band as NBR 
+  var area1 = areaCalculate(NBR); // calculate the area with post-fire estimation
+  NBR = NBR.set({ // copy the properties of each image to NBR image as well  
+    'SUITABILITY': img1.get('SUITABILITY'),
+    'IMAGE_COVERAGE_PERCENTAGE': img1.get('IMAGE_COVERAGE_PERCENTAGE'),
+    'TIMELAG': img1.get('TIMELAG'), 
+    'CLOUD_COVERAGE_AOI' : img1.get('CLOUD_COVERAGE_AOI'),
+    'Area': area1
+  });
+  return  NBR.set('position', j);//this j will demonestrate the position of the used image in the image collection which is further used for the iteration process
+} 
+//masking one NBR with another NBR from previous iteration to prevent having different estimation for the same area 
+function iteration_NBR (img1,img){
+  img1 = ee.Image(img1); //making sure that the input is an image (GEE optimization)
+  img = ee.Image(img); //making sure that the input is an image (GEE optimization)
+  var overlapMask = img1.where(img,1); //overlapping pixels value will be converted to have values of 1
+  var mask = overlapMask.neq(1); //apply a mask with no pixels with value 1
+  img1 = overlapMask.updateMask(mask); //mask one image with another 
+  return ee.Image(img1); //returning an image
+}
+//masking one dNBR with another dNBR from previous iteration to prevent having different dNBR estimation for the same area 
+function iteration_dNBR (img1,img){
+  img1 = ee.Image(img1); //making sure that the input is an image (GEE optimization)
+  img = ee.Image(img); //making sure that the input is an image (GEE optimization)
+  var overlapMask = img1.where(img,2); //overlapping pixels value will be converted to have values of 2 
+  var mask = overlapMask.neq(2);//apply a mask with no pixels with value 1
+  img1 = overlapMask.updateMask(mask);//mask one image with another 
+  return ee.Image(img1); //returning an image
+}
+//calculating the dNBR offset 
+function dNBR_offset_cal(j, k, CollectionPre, CollectionPost, region, x) {
+  // buffer area (180m buffer)
+  var withbuffer = region.geometry().buffer(180); //when using MODIS, this number needs to be converted to 500
+  var onlyBuffer = withbuffer.difference(region.geometry(), ee.ErrorMargin(1)); // just the buffer
+  // pre NBR
+  var preList = CollectionPre.toList(CollectionPre.size()); //converting the image collection into a list
+  var pre_img = ee.Image(preList.get(j)); //getting the j image of the list based on the suitability and used in preNBR calculation
+  pre_img = maskClouds(pre_img).clip(withbuffer); //clip the image to only the buffer araea 
+  pre_img = renameBands(pre_img); //renaming the bands of input image 
+  var NBR_pre = pre_img.normalizedDifference(['NIR', 'SWIR']).rename('NBR'); //calculating preNBR within the buffer area of the BA
+  // post NBR
+  var postList = CollectionPost.toList(CollectionPost.size());
+  var post_img = ee.Image(postList.get(k)); //getting the k image of the list based on the suitability and used in postNBR calculation
+  post_img = maskClouds(post_img).clip(withbuffer);//clip the image to only the buffer araea 
+  post_img = renameBands(post_img);//renaming the bands of input image 
+  var NBR_post = post_img.normalizedDifference(['NIR', 'SWIR']).rename('NBR');//calculating postNBR within the buffer area of the BA
+  // dNBR
+  var dNBR = NBR_pre.subtract(NBR_post); //calculating the dNBR within the buffer of BA
+  // mean dNBR in the buffer
+  var dNBROffset = ee.Number( 
+    dNBR.reduceRegion({
+      reducer: ee.Reducer.mean(),
+      geometry: onlyBuffer,
+      scale: Scale_all,
+    }).get('NBR') //for GEE optimization the formulas of NBR and dNBR calculations have not been used and as the result the output band in called NBR
+  );
+  if (dNBROffset.getInfo() === null) { 
+    dNBROffset = ee.Number(0); // Set to 0 if there are no pixels
+  }
+  var RdNBR = RdNBR_cal(NBR_pre, dNBR); //calculating the RdNBR within the buffer of BA
+   // mean RdNBR in the buffer
+  var RdNBRoffset = ee.Number(
+    RdNBR.reduceRegion({
+      reducer: ee.Reducer.mean(),
+      geometry: onlyBuffer,
+      scale: Scale_all,
+    }).get('RdNBR')
+  );
+  if (RdNBRoffset.getInfo() === null) {
+    RdNBRoffset = ee.Number(0); // Set to 0 if there are no pixels
+  }
+  var RBR = RBR_cal(NBR_pre, dNBR); //calculating RBR within the buffer of BA
+  //Mean RBR in the buffer
+  var RBRoffset = ee.Number(
+    RBR.reduceRegion({
+      reducer: ee.Reducer.mean(),
+      geometry: onlyBuffer,
+      scale: Scale_all,
+    }).get('RBR')
+  );
+  if (RBRoffset.getInfo() === null) {
+    RBRoffset = ee.Number(0); // Set to 0 if there are no pixels
+  }
+  var dNBR_EVI = dNBR_EVI_cal(CollectionPost, k, dNBR); //calculating dNBR_EVI in the buffer of BA
+  //calculating the mean dNBR-EVI in the buffer
+  var dNBR_EVIoffset = ee.Number(
+    dNBR_EVI.reduceRegion({
+      reducer: ee.Reducer.mean(),
+      geometry: onlyBuffer,
+      scale: Scale_all,
+    }).get('dNBR-EVI')
+  );
+  if (dNBR_EVIoffset.getInfo() === null) {
+    dNBR_EVIoffset = ee.Number(0); // Set to 0 if there are no pixels
+  }
+  //creating a string with all the offsets
+  var oofset = ee.String(x.toString())
+    .cat("_Fire_")
+    .cat(i.toString())
+    .cat("_")
+    .cat(year.toString())
+    .cat("_")
+    .cat('dNBROffset_')
+    .cat(dNBROffset.format('%.4f'))
+    .cat('_RdNBROffset_')
+    .cat(RdNBRoffset.format('%.4f'))
+    .cat('_RBROffset_')
+    .cat(RBRoffset.format('%.4f'))
+    .cat('_dNBR_EVIoffset_')
+    .cat(dNBR_EVIoffset.format('%.4f'));
+  return oofset; //returning the string with all the offsets
+}
+//creating the export name of dNBR based on the properties of pre-fire NBR and post-fireNBR 
+function exportIndices(x,imgPre, imgPost,SdNBR) {
+  var preTL = imgPre.get("TIMELAG"); //getting pre-fire Timelag 
+  var preCC = imgPre.get("CLOUD_COVERAGE_AOI");  //getting pre-fire cloud% within AOI
+  var preSuit = imgPre.get("SUITABILITY"); //getting pre-fire suitability% 
+  var postTL = imgPost.get("TIMELAG");  //getting post-fire Timelag 
+  var postCC = imgPost.get("CLOUD_COVERAGE_AOI"); //getting post-fire cloud% within AOI
+  var postSuit = imgPost.get("SUITABILITY"); //getting post-fire suitability% 
+  var confidence = ((ee.Number(imgPre.get('SUITABILITY')).add(ee.Number(imgPost.get('SUITABILITY')))).divide(2)).round(); //based on suitability of pre and post NBR, calculate the confidence (suitability_pre+suitability_post/2)
+  var nameExport = ee.String(x.toString()) //x be defined for each iteration, x=0 as the reference iteration, and x=1 as the first iteration and so on. x<=2 as there is only 3 iterations
+      .cat("_Fire_")
+      .cat(i.toString()) //used as an iside control to check if the for loop is working
+      .cat("_")
+      .cat(year.toString()) //the year in which each fire burnt 
+      .cat("_")
+      .cat(id) //the ID of each fire
+      .cat("_preTL_")
+      .cat((ee.Number(preTL)).abs().format('%01d')) // Timelag of pre-fire image converted to integer 
+      .cat("_preCC_")
+      .cat(((ee.Number(preCC).multiply(1)).round()).format('%01d')) 
+      .cat("_preSuit_")
+      .cat((ee.Number(preSuit).round()).format('%01d'))// suitability% of pre-fire image converted to integer
+      .cat("_postTL_")
+      .cat((ee.Number(postTL)).abs().format('%01d'))  // Timelag of post-fire image converted to integer 
+      .cat("_postCC_")
+      .cat(((ee.Number(postCC).multiply(1)).round()).format('%01d'))// cloud% of post-fire image converted to integer 
+      .cat("_postSuit_")
+      .cat((ee.Number(postSuit).round()).format('%01d')) // suitability% of post-fire image converted to integer 
+      .cat("_dNBRarea_")
+      .cat(ee.Number(SdNBR).format('%01d')) //area with dNBR estimation in ha
+      .cat("_firearea_")
+      .cat(ee.Number(area).format('%01d')) //area with fire in ha
+      .cat("_Confidence_")
+      .cat(ee.Number(confidence).format('%01d')); //confidence in calculated dNBR based on the suitability of pre & post NBR 
+  return nameExport; //Concatenated properties and converted into String to be the name of each dNBR (from each iteration)
+}
+//iteration for condition: pre 
+function iteration_pre_whole(CollectionPre, preNBR, postNBR,CollectionPost) {
+  CollectionPre = CollectionPre.filterMetadata('IMAGE_COVERAGE_PERCENTAGE','greater_than',80);//only images which cover 80% of AOI
+  CollectionPre = CollectionPre.filterMetadata('CLOUD_COVERAGE_AOI','less_than',90);//only images which cloud contamination less than 90% (at leat 5% of AOI is cloudfree)
+  CollectionPre = CollectionPre.sort("SUITABILITY",false); //sorting the images based on their suitability from the image with highest suitability to image with least suitability
+  var PreNBR1All = ee.List([]); // an empty variable to feed the calculations after the loop
+  var size_pre = CollectionPre.size().getInfo(); // get the size of the input pre-fire collection
+  for (var j = 1; j < size_pre; j++) {
+    var preNBR1NEW = NBR_cal_pre1(CollectionPre, j); //calculating the NBR of each image in the collection except from the reference image 
+    preNBR1NEW = iteration_NBR(preNBR1NEW, preNBR); //masking each NBR with the one obtained from previous iteration 
+    var areaPre = areaCalculate(preNBR1NEW); //calculate the area of each NBR 
+    if (areaPre.gte(70).getInfo()) { //feed this NBR into the list if its area is larger than 70ha 
+      PreNBR1All = PreNBR1All.add(ee.List(preNBR1NEW));
+    } else {
+      continue;
+    }
+  }
+  var PreNBR1AllSize = PreNBR1All.size().getInfo(); //get the size of list of the masked NBRs
+  // an empty variable to feed the calculations after the loop 
+  var dNBR_pre_new = ee.List([]);
+  var names_pre_new = ee.List([]);
+  var confidence_pre_new = ee.List([]);
+  var RdNBR_pre_new = ee.List([]);
+  var offset_pre_new = ee.List([]);
+  var dNBR_EVI_pre_new = ee.List([]);
+  var RBR_pre_new = ee.List([]);
+  //variables changing within each if statement
+  var preNBR0, preNBR1, preNBR2;
+  for (var a = 0; a < PreNBR1AllSize; a++) {
+    //variables changing within each if statement
+    var dNBR_new_pre;
+    var names_new; 
+    var confidence_new;
+    var RdNBR_new; 
+    var offset_new;
+    var dNBR_EVI_new; 
+    var RBR_new;
+    var position;
+    if (a === 0) {
+      preNBR0 = PreNBR1All.get(a); // getting the first NBR (first highest suitability)
+      preNBR0 = ee.Image(preNBR0);
+      var area0 = areaCalculate(preNBR0); //calculate its area 
+      if (area0.lt(5).getInfo()){ //if its area is zero then break the loop and go to next a (a++)
+        continue;
+      }
+      dNBR_new_pre = dNBR_cal(preNBR0, postNBR); //calculate the dNBR of first iteration based on new preNBR (the second best NBR of image collection and the best in the preNBR list) and ref_postNBR(postNBR calculated from 0 iteration)
+      confidence_new = confidence_cal(dNBR_new_pre); //create the confidence raster of this new dNBR
+      RdNBR_new = RdNBR_cal(preNBR0, dNBR_new_pre); //calculate the RdNBR based on the new preNBR and new dNBR
+      position = preNBR0.get('position'); //getting the position of the best preNBR of the list in the pre-fire image collection
+      position = ee.Number(position); //convert this position into number 
+      offset_new =  dNBR_offset_cal (position,0, CollectionPre, CollectionPost, region,a+1); //calculate the offset based on the new preNBR and reference postNBR
+      names_new =  exportIndices(a+1,preNBR0,postNBR,area0); //create the name of the dNBR based on properties of preNBR and postNBR
+      dNBR_EVI_new = dNBR_EVI_cal(CollectionPost,0,dNBR_new_pre); //calculating the dNBR-EVI index
+      RBR_new = RBR_cal (preNBR0, dNBR_new_pre);
+    } 
+    else if (a === 1) {
+      preNBR1 = PreNBR1All.get(a);// getting the second NBR (second highest suitability)
+      preNBR1 = ee.Image(preNBR1);
+      preNBR1 = iteration_NBR(preNBR1, preNBR0); //mask the preNBR of second iteration with the one from first iteration
+      var area1 = areaCalculate(preNBR1); //calculate its area 
+      if (area1.lt(5).getInfo()){ //if its area is zero then break the loop and go to next a (a++)
+        continue;
+      }
+      dNBR_new_pre = dNBR_cal(preNBR1, postNBR); //calculate the dNBR of second iteration based on new preNBR and ref_postNBR(postNBR calculated from fisrt iteration)
+      confidence_new = confidence_cal(dNBR_new_pre);//create the confidence raster of this new dNBR
+      RdNBR_new = RdNBR_cal(preNBR1, dNBR_new_pre); //calculate the RdNBR based on the new preNBR and new dNBR
+      position = preNBR1.get('position');//getting the position of the secondbest preNBR of the list in the pre-fire image collection
+      position = ee.Number(position); //position into number
+      offset_new =  dNBR_offset_cal (position,0, CollectionPre, CollectionPost, region,a+1);//calculate the offset based on the new dNBR
+      names_new =  exportIndices(a+1,preNBR1,postNBR,area1);  //create the name of the dNBR based on properties of preNBR and postNBR
+      dNBR_EVI_new = dNBR_EVI_cal(CollectionPost,0,dNBR_new_pre); //calculating the dNBR-EVI index
+      RBR_new = RBR_cal (preNBR1, dNBR_new_pre);
+    } 
+    else if (a === 2) {
+      preNBR2 = PreNBR1All.get(a);
+      preNBR2 = iteration_NBR(preNBR2, preNBR1);//mask the preNBR of third iteration with the one from second iteration
+      preNBR2 = iteration_NBR(preNBR2, preNBR0);//mask the preNBR of third iteration with the one from first iteration
+      preNBR2 = ee.Image(preNBR2);
+      var area2 = areaCalculate(preNBR2); //calculate its area 
+      if (area2.lt(5).getInfo()){ //if its area is zero then break the loop and go to next a (a++)
+        continue;
+      }
+      dNBR_new_pre = dNBR_cal(preNBR2, postNBR); //calculate the dNBR of third iteration based on new preNBR and ref_postNBR(postNBR calculated from fisrt iteration)
+      confidence_new = confidence_cal(dNBR_new_pre);//create the confidence raster of this new dNBR
+      RdNBR_new = RdNBR_cal(preNBR2, dNBR_new_pre); //calculate the RdNBR based on the new preNBR and new dNBR
+      position = preNBR2.get('position'); //getting the position of the third best preNBR of the list in the pre-fire image collection
+      position = ee.Number(position);
+      offset_new =  dNBR_offset_cal (position,0, CollectionPre, CollectionPost, region,a+1);//calculate the offset based on the new dNBR
+      names_new =  exportIndices(a+1,preNBR2,postNBR,area2);//create the name of the dNBR based on properties of preNBR and postNBR
+      dNBR_EVI_new = dNBR_EVI_cal(CollectionPost,0,dNBR_new_pre); //calculating the dNBR-EVI index
+      RBR_new = RBR_cal (preNBR2, dNBR_new_pre);
+    }
+    else if (a>=3){ //do not continue for more than 3 iterations 
+      continue;
+    }
+    dNBR_pre_new = dNBR_pre_new.add(ee.List(dNBR_new_pre)); //feed all the dNBRs from the iterations into the var 
+    names_pre_new  = names_pre_new.add(ee.List(names_new));  //feed all the names from the iterations into the var 
+    confidence_pre_new = confidence_pre_new.add(ee.List(confidence_new));  //feed all the confidence from the iterations into the var 
+    RdNBR_pre_new = RdNBR_pre_new.add(ee.List(RdNBR_new));  //feed all the RdNBRs from the iterations into the var 
+    offset_pre_new = offset_pre_new.add(ee.List(offset_new));//calculate the offset based on the new dNBR
+    dNBR_EVI_pre_new = dNBR_EVI_pre_new.add(ee.List(dNBR_EVI_new)); //calculate dNBR-EVI based on new dNBR 
+    RBR_pre_new = RBR_pre_new.add(ee.List(RBR_new));
+  }
+  return { //returning the iterated new indices with new preNBR images 
+    dNBR:dNBR_pre_new,
+    names: names_pre_new,
+    confidence: confidence_pre_new,
+    RdNBR: RdNBR_pre_new,
+    offset:offset_pre_new,
+    dNBR_EVI: dNBR_EVI_pre_new,
+    RBR: RBR_pre_new
+  };
+}
+//iteration for condition: post 
+function iteration_post_whole(CollectionPost, preNBR, postNBR) {
+  CollectionPost = CollectionPost.filterMetadata('IMAGE_COVERAGE_PERCENTAGE','greater_than',80); //only images which cover 80% of AOI
+  CollectionPost = CollectionPost.filterMetadata('CLOUD_COVERAGE_AOI','less_than',90);//only images which cloud contamination less than 90% (at leat 5% of AOI is cloudfree)
+  CollectionPost = CollectionPost.sort("SUITABILITY",false);//sorting the images based on their suitability from the image with highest suitability to image with least suitability
+  var PostNBR1All = ee.List([]);// an empty variable to feed the calculations after the loop
+  var size_post = CollectionPost.size().getInfo(); // get the size of the input pre-fire collection
+  for (var j = 1; j < size_post; j++) {
+    var postNBR1NEW = NBR_cal_post1(CollectionPost, j); //calculating the NBR of each image in the collection 
+    postNBR1NEW = iteration_NBR(postNBR1NEW, postNBR); //masking each NBR with the one obtained from previous iteration 
+    var areaPost = areaCalculate(postNBR1NEW); //calculate the area of each NBR 
+    if (areaPost.gte(70).getInfo()) { //feed this NBR into the list if its area is larger than 70ha 
+      PostNBR1All = PostNBR1All.add(ee.List(postNBR1NEW));
+    } else {
+      continue;
+    }
+  }
+  var PostNBR1AllSize = PostNBR1All.size().getInfo(); //get the size of list of the masked NBRs
+  // an empty variable to feed the calculations after the loop 
+  var dNBR_post_new = ee.List([]);
+  var names_post_new = ee.List([]);
+  var confidence_post_new = ee.List([]);
+  var RdNBR_post_new = ee.List([]);
+  var offset_post_new = ee.List([]);
+  var dNBR_EVI_post_new = ee.List([]);
+  var RBR_post_new = ee.List([]);
+  //variables changing within each if statement
+  var postNBR0, postNBR1, postNBR2;
+  for (var a = 0; a < PostNBR1AllSize; a++) {
+    //variables changing within each if statement
+    var dNBR_new_post,names_new,confidence_new,RdNBR_new,offset_new,dNBR_EVI_new, RBR_new,position;
+    if (a === 0) { 
+      postNBR0 = PostNBR1All.get(a); // getting the first NBR (first highest suitability)
+      postNBR0 = ee.Image(postNBR0);
+      var area0 = areaCalculate(postNBR0); //calculate its area 
+      if (area0.lt(5).getInfo()){ //if its area is zero then break the loop and go to next a (a++)
+        continue;
+      }
+      dNBR_new_post = dNBR_cal(preNBR, postNBR0); //calculate the dNBR of first iteration based on reference preNBR (preNBR calculated from 0 iteration) andnew postNBR (from 1st iteration)
+      confidence_new = confidence_cal(dNBR_new_post);//create the confidence raster of this new dNBR
+      RdNBR_new = RdNBR_cal(preNBR, dNBR_new_post);//calculate the RdNBR based on the ref preNBR and new dNBR
+      position = postNBR0.get('position'); //getting the position of best postNBR of the list in the post-fire image collection
+      position = ee.Number(position); //converting this position into number
+      offset_new =  dNBR_offset_cal (0,position, CollectionPre, CollectionPost, region,a+1);//calculate the offset based on the new dNBR
+      names_new =  exportIndices(a+1,preNBR,postNBR0,area0);//create the name of the dNBR based on properties of preNBR and postNBR
+      dNBR_EVI_new = dNBR_EVI_cal(CollectionPost,position,dNBR_new_post); //calculating the dNBR-EVI index (except for scenarios that the post-fire image is not the 2nd one in the post-fire image collection to calculate which caution and manually correction is needed)
+      RBR_new = RBR_cal (preNBR, dNBR_new_post);//calculating iterated RBR
+    } 
+    else if (a === 1) {
+      postNBR1 = PostNBR1All.get(a); // getting the second NBR (second highest suitability)
+      postNBR1 = ee.Image(postNBR1);
+      postNBR1 = iteration_NBR(postNBR1, postNBR0); //masking this NBR with NBR from first iteration (a=0)
+      var area1 = areaCalculate(postNBR1); //calculate its area 
+      if (area1.lt(5).getInfo()){ //if its area is zero then break the loop and go to next a (a++)
+        continue;
+      }
+      dNBR_new_post = dNBR_cal(preNBR, postNBR1);//calculate the dNBR of first iteration based on reference preNBR (preNBR calculated from 0 iteration) and new postNBR (from 2nd iteration)
+      confidence_new = confidence_cal(dNBR_new_post);//create the confidence raster of this new dNBR
+      RdNBR_new = RdNBR_cal(preNBR, dNBR_new_post);//calculate the RdNBR based on the ref preNBR and new dNBR
+      position = postNBR1.get('position'); //getting the position of second best postNBR of the list in the post-fire image collection
+      position = ee.Number(position); //converting this position into number
+      offset_new =  dNBR_offset_cal (0,position, CollectionPre, CollectionPost, region,a+1);//calculate the offset based on the new dNBR
+      names_new =  exportIndices(a+1,preNBR,postNBR1,area1);//create the name of the dNBR based on properties of preNBR and postNBR
+      dNBR_EVI_new = dNBR_EVI_cal(CollectionPost,position,dNBR_new_post); //calculating the dNBR-EVI index
+      RBR_new = RBR_cal (preNBR, dNBR_new_post);//calculating iterated RBR
+    } 
+    else if (a === 2) {
+      postNBR2 = PostNBR1All.get(a); // getting the third NBR (third highest suitability)
+      postNBR2 = iteration_NBR(postNBR2, postNBR1); //masking this NBR with NBR from second iteration (a=1)
+      postNBR2 = iteration_NBR(postNBR2, postNBR0);//masking this NBR with NBR from first iteration (a=0)
+      postNBR2 = ee.Image(postNBR2);
+      var area2 = areaCalculate(postNBR2);
+      if (area2.lt(5).getInfo()){//if its area is zero then break the loop and go to next a (a++)
+        continue;
+      }
+      dNBR_new_post = dNBR_cal(preNBR, postNBR2);//calculate the dNBR of first iteration based on reference preNBR (preNBR calculated from 0 iteration) and new postNBR (from 3rd iteration)
+      confidence_new = confidence_cal(dNBR_new_post);//create the confidence raster of this new dNBR
+      RdNBR_new = RdNBR_cal(preNBR, dNBR_new_post);//calculate the RdNBR based on the ref preNBR and new dNBR
+      position = postNBR2.get('position'); //getting the position of third best postNBR of the list in the post-fire image collection
+      position = ee.Number(position); //converting this position into number
+      offset_new =  dNBR_offset_cal (0,position, CollectionPre, CollectionPost, region,a+1);//calculate the offset based on the new dNBR
+      names_new =  exportIndices(a+1,preNBR,postNBR2,area2);//create the name of the dNBR based on properties of preNBR and postNBR
+      dNBR_EVI_new = dNBR_EVI_cal(CollectionPost,position,dNBR_new_post); //calculating the dNBR-EVI index
+      RBR_new = RBR_cal (preNBR, dNBR_new_post);//calculating iterated RBR
+    } else if (a>=3){//do not continue for more than 3 iterations 
+      continue;
+    }
+    dNBR_post_new = dNBR_post_new.add(ee.List(dNBR_new_post)); //feed all the dNBRs from the iterations into the var 
+    names_post_new  = names_post_new.add(ee.List(names_new));//feed all the names from the iterations into the var 
+    confidence_post_new = confidence_post_new.add(ee.List(confidence_new)); //feed all the confidences from the iterations into the var 
+    RdNBR_post_new = RdNBR_post_new.add(ee.List(RdNBR_new));//feed all the RdNBRs from the iterations into the var 
+    offset_post_new = offset_post_new.add(ee.List(offset_new));//feed all the new offsets into the var
+    dNBR_EVI_post_new = dNBR_EVI_post_new.add(ee.List(dNBR_EVI_new)); //feed all the new dNBR_EVI into the var
+    RBR_post_new = RBR_post_new.add(ee.List(RBR_new));
+  }
+  return { //returning iterated severity indices with new post-fire images
+    dNBR:dNBR_post_new,
+    names: names_post_new,
+    confidence: confidence_post_new,
+    RdNBR: RdNBR_post_new,
+    offset:offset_post_new,
+    dNBR_EVI: dNBR_EVI_post_new,
+    RBR: RBR_post_new
+  };
+}
+//iteration for condition: not_intersected
+function iteration_pre_post_not_intersected(CollectionPre,CollectionPost, preNBR, postNBR,dNBR) {
+  //getting pre-fire images with coverage of at leat 80% and at least 5% cloudfree pixels, sorted from highest to lowest suitability 
+  CollectionPre = CollectionPre.filterMetadata('IMAGE_COVERAGE_PERCENTAGE','greater_than',80);
+  CollectionPre = CollectionPre.filterMetadata('CLOUD_COVERAGE_AOI','less_than',90);
+  CollectionPre = CollectionPre.sort("SUITABILITY",false);
+  //getting post-fire images with coverage of at leat 80% and at least 5% cloudfree pixels, sorted from highest to lowest suitability 
+  CollectionPost = CollectionPost.filterMetadata('IMAGE_COVERAGE_PERCENTAGE','greater_than',80);
+  CollectionPost = CollectionPost.filterMetadata('CLOUD_COVERAGE_AOI','less_than',90);
+  CollectionPost = CollectionPost.sort("SUITABILITY",false);
+  var size_pre = CollectionPre.size(); //getting the size of prefire image collection
+  var size_post = CollectionPost.size(); //getting the size of post fire image collection 
+  //variables to be filled throughout the function
+  var dNBR_T, names_T,confidence_T,RdNBR_T,offset_T,dNBR_EVI_T,RBR_T;
+  var preNBR1NEW, dNBR1,area1,dNBR_EVI1,confidence1,RdNBR1,names1,offset_new1,RBR1;
+  var postNBR1NEW, dNBR2,area2,dNBR_EVI2,confidence2,RdNBR2,names2,offset_new2,RBR2;
+  //if there are more than 2 images in the pre-collection and there are more than 2 images in the post-collection 
+  if(size_pre.gte(2).getInfo() && size_post.gte(2).getInfo()){
+    preNBR1NEW = NBR_cal_pre1(CollectionPre, 1);//calculating NBR of the image with second highes suitability
+    dNBR1 = dNBR_cal(preNBR1NEW, postNBR); // calculate the dNBR based on new preNBR and reference postNBR
+    dNBR1 = iteration_dNBR (dNBR1,dNBR); //mask new dNBR with ref dNBR (obtained from iteration 0)
+    area1 = areaCalculate(dNBR1); //calculate the area of the new dNBR
+    dNBR_EVI1 = dNBR_EVI_cal(CollectionPost,0,dNBR1); //calculating the dNBR-EVI index 
+    postNBR1NEW = NBR_cal_post1(CollectionPost, 1); //calculating NBR of the image with second highes suitability
+    dNBR2 = dNBR_cal(preNBR, postNBR1NEW);// calculate the dNBR based on reference preNBR and new postNBR
+    dNBR2 = iteration_dNBR (dNBR2,dNBR);//mask new dNBR with ref dNBR (obtained from iteration 0)
+    area2 = areaCalculate(dNBR2);//calculate the area of the new dNBR 
+    dNBR_EVI2 = dNBR_EVI_cal(CollectionPost,1,dNBR2); //calculating the dNBR-EVI index
+    var dNBR_list = ee.List([dNBR1,dNBR2]).flatten(); //create a list of new dNBRs
+    var dNBR_Col = ee.ImageCollection.fromImages(dNBR_list); //convert the list into imagecollection
+    dNBR_T = dNBR_Col.mosaic(); //mosaic new dNBRs
+    var dNBR_EVI_list = ee.List([dNBR_EVI1,dNBR_EVI2]).flatten(); //create a list of new dNBR_EVIs
+    var dNBR_EVI_Col = ee.ImageCollection.fromImages(dNBR_EVI_list); //convert the list into imagecollection
+    dNBR_EVI_T = dNBR_EVI_Col.mosaic(); //mosaic new dNBR_EVIs
+    confidence1 = confidence_cal(dNBR1); //create the confidence raster of new dNBR1 
+    confidence2 = confidence_cal(dNBR2);//create the confidence raster of new dNBR2
+    var confi_list = ee.List([confidence1,confidence2]).flatten(); //both confidences into one list 
+    var confi_Col = ee.ImageCollection.fromImages(confi_list); //convert the list into one image collection
+    confidence_T = confi_Col.mosaic();//mosaic the new confidences 
+    RdNBR1 = RdNBR_cal(preNBR1NEW, dNBR1);//calculate the new RdNBR1 
+    RdNBR2 = RdNBR_cal(preNBR, dNBR2); //calculate the new RdNBR2 
+    var RdNBR_list = ee.List([RdNBR1,RdNBR2]).flatten(); //fill new RdNBRs into a list  
+    var RdNBR_Col = ee.ImageCollection.fromImages(RdNBR_list); //list to image collection
+    RdNBR_T = RdNBR_Col.mosaic();// mosaic RdNBRs 
+    RBR1 = RBR_cal (preNBR1NEW, dNBR1); //calculating RBR with new pre and new dNBR
+    RBR2 = RBR_cal(preNBR, dNBR2); //calculating RBR with ref pre and new dNBR
+    var RBR_list = ee.List([RBR1,RBR2]).flatten(); //making new RBR a list
+    var RBR_Col = ee.ImageCollection.fromImages(RBR_list);  //list to imagecollection
+    RBR_T = RBR_Col.mosaic(); //mosaic the loist of new RBR
+    offset_new1 =  dNBR_offset_cal (1,0, CollectionPre, CollectionPost, region,1);//calculate the offset based on the new dNBR with new pre 
+    offset_new2 =  dNBR_offset_cal (0,1, CollectionPre, CollectionPost, region,1);//calculate the offset based on the new dNBR with new post
+    offset_T = ee.List([offset_new1,offset_new2]).flatten();//one list with each offset
+    names1 = exportIndices(1,preNBR1NEW,postNBR,area1); //create the name of first new dNBR based on properties of preNBR and postNBR used 
+    names2 = exportIndices(1,preNBR,postNBR1NEW,area2); //create the name of second new dNBR based on properties of preNBR and postNBR used 
+    names_T = ee.List([names1,names2]).flatten(); //convert the names into a list 
+    var area1and2 = area1.add(area2); //getting the sum of area of both new dNBRs 
+    var dNBR_REF_AREA = areaCalculate(dNBR);
+    area_original = ee.Number(area_original).subtract(dNBR_REF_AREA);  //area without dNBR estimation
+    var diff = area_original.subtract(area1and2);//area with no dNBR estimation (the fisrt iteration did not cover)
+    if(diff.gte(70).getInfo()) {
+      var dNBR3 = dNBR_cal(preNBR1NEW, postNBR1NEW); //dNBR with second best pre and post 
+      dNBR3 = iteration_dNBR (dNBR3,dNBR); //mask with ref dNBR 
+      dNBR3 = iteration_dNBR (dNBR3,dNBR1); //mask with dNBR1 (new pre and ref post)
+      dNBR3 = iteration_dNBR (dNBR3,dNBR2); //mask with dNBR2 (ref pre and new post)
+      var area3 = areaCalculate(dNBR3); //area of dNBR3
+      var dNBR_EVI3 = dNBR_EVI_cal(CollectionPost,1,dNBR3);  //dNBR_EVI based on dNBR3
+      var RdNBR3 = RdNBR_cal(preNBR1NEW, dNBR3); //RdNBR based on dNBR3
+      var RBR3 = RBR_cal(preNBR1NEW, dNBR3); //RBR based on dNBR3
+      var confidence3 = confidence_cal(dNBR3); //confidence based on dNBR3
+      var offset_new3 =  dNBR_offset_cal (1,1, CollectionPre, CollectionPost, region,2); //offset based on dNBR3 pair of images used 
+      var names3 = exportIndices(2,preNBR1NEW,postNBR1NEW,area3); //new details of dNBR3 
+      dNBR_T =ee.List([dNBR1,dNBR2,dNBR3]).flatten(); //feeding dNBR1, dNBR2, and dNBR3 into dNBR_T as a list
+      names_T = ee.List([names1,names2,names3]).flatten(); //feeding all the properties of dNBR1, dNBR2, and dNBR3 as a list 
+      confidence_T = ee.List([confidence1,confidence2,confidence3]).flatten(); //feeding all the confidenece as a list
+      RdNBR_T = ee.List([RdNBR1,RdNBR2,RdNBR3]).flatten(); //feeding all the RdNBRs as a list
+      RBR_T = ee.List([RBR1,RBR2,RBR3]).flatten(); //feeding all the RBRs as a list
+      offset_T = ee.List([offset_new1,offset_new2,offset_new3]).flatten(); //feeding all the offsets as a list
+      dNBR_EVI_T = ee.List([dNBR_EVI1,dNBR_EVI2,dNBR_EVI3]).flatten(); //feeding all the dNBR_EVI as a list
+      var area1and2area3 = area1.add(area2).add(area3); //sum of areas o dNBR1, dNBR2, and dNBR3
+      dNBR_REF_AREA = areaCalculate(dNBR); //area of referennce dNBR
+      area_original = ee.Number(area_original).subtract(dNBR_REF_AREA); //area without dNBR estimation after 0 iteration
+      var diff1 = area_original.subtract(area1and2area3); //the remaining area with no dNBR estimation
+      if(diff1.gte(70).getInfo() && size_pre.gte(3).getInfo() && size_post.gte(3).getInfo()){ //the remaining area is still larger than 70ha and there are at least 3 and more images in both pre and post fire image collections
+        var preNBR2NEW = NBR_cal_post1(CollectionPre, 2);
+        var postNBR2NEW = NBR_cal_post1(CollectionPost, 2);
+        var dNBR4 = dNBR_cal(preNBR2NEW, postNBR2NEW); //dNBR based on third best pre and post fire images 
+        dNBR4 = iteration_dNBR (dNBR4,dNBR); //masking with dNBR
+        dNBR4 = iteration_dNBR (dNBR4,dNBR1);//masking with dNBR1
+        dNBR4 = iteration_dNBR (dNBR4,dNBR2);//masking with dNBR2
+        dNBR4 = iteration_dNBR (dNBR4,dNBR3);//masking with dNBR3
+        var area4 = areaCalculate(dNBR4); //calculating the area of dNBR4
+        var dNBR_EVI4 = dNBR_EVI_cal(CollectionPost,2,dNBR4); //new dNBR_EVI based on dNBR4
+        var RdNBR4 = RdNBR_cal(preNBR2NEW, dNBR4);//new RdNBR based on dNBR4
+        var RBR4 = RBR_cal(preNBR2NEW, dNBR4);//new RBR based on dNBR4
+        var confidence4 = confidence_cal(dNBR4); //new confidence based on dNBR4
+        var offset_new4 =  dNBR_offset_cal (2,2, CollectionPre, CollectionPost, region,3);//new offset based on dNBR4
+        var names4 = exportIndices(3,preNBR2NEW,postNBR2NEW,area4);//new properties of dNBR4
+        //feeding indeces of this iteration as a list
+        dNBR_T =ee.List([dNBR1,dNBR2,dNBR3,dNBR4]).flatten();
+        names_T = ee.List([names1,names2,names3,names4]).flatten();
+        confidence_T = ee.List([confidence1,confidence2,confidence3,confidence4]).flatten();
+        RdNBR_T = ee.List([RdNBR1,RdNBR2,RdNBR3,RdNBR4]).flatten();
+        offset_T = ee.List([offset_new1,offset_new2,offset_new3,offset_new4]).flatten();
+        dNBR_EVI_T = ee.List([dNBR_EVI1,dNBR_EVI2,dNBR_EVI3,dNBR_EVI4]).flatten();
+        RBR_T = ee.List([RBR1,RBR2,RBR3,RBR4]).flatten();
+        dNBR_REF_AREA = areaCalculate(dNBR); //area of referennce dNBR
+        area_original = ee.Number(area_original).subtract(dNBR_REF_AREA); //area without dNBR estimation after 0 iteration
+        var area1area2area3area4 = area1and2area3.add(area4);//sum of areas of dNBR1, dNBR2, dNBR3, and dNBR4
+        var diff2 = area_original.subtract(area1area2area3area4);  // area still with no dNBR estimation 
+        if (diff2.gte(70).getInfo()) { // remaining area still is larger than 70ha 
+        //refiltered both pre- and post-fire image collections to images with at leat 99% image coverage and the maximum cloud cover within BA of 10%
+          CollectionPre = CollectionPre.filterMetadata('IMAGE_COVERAGE_PERCENTAGE','greater_than',99);
+          CollectionPre = CollectionPre.filterMetadata('CLOUD_COVERAGE_AOI','less_than',10);
+          CollectionPost = CollectionPost.filterMetadata('CLOUD_COVERAGE_AOI','less_than',10);
+          CollectionPost = CollectionPost.filterMetadata('IMAGE_COVERAGE_PERCENTAGE','greater_than',99);
+          var preNBR3NEW = NBR_cal_post1(CollectionPre, 0); //best pre from new filtered pre-fire image collection
+          var postNBR3NEW = NBR_cal_post1(CollectionPost, 0);//best post from new filtered post-fire image collection
+          var dNBR5 = dNBR_cal(preNBR3NEW, postNBR3NEW); //new dNBR with the best pair of refiltered image collections
+          dNBR5 = iteration_dNBR (dNBR5,dNBR); //masking with dNBR
+          dNBR5 = iteration_dNBR (dNBR5,dNBR1);//masking with dNBR1
+          dNBR5 = iteration_dNBR (dNBR5,dNBR2);//masking with dNBR2
+          dNBR5 = iteration_dNBR (dNBR5,dNBR3);//masking with dNBR3
+          dNBR5 = iteration_dNBR (dNBR5,dNBR4);//masking with dNBR4 
+          var area5 = areaCalculate(dNBR5); //area of dNBR5
+          var dNBR_EVI5 = dNBR_EVI_cal(CollectionPost,0,dNBR5);  //dNBR_EVI based on new dNBR
+          var RdNBR5 = RdNBR_cal(preNBR3NEW, dNBR5); //RdNBR based on new dNBR
+          var RBR5 = RBR_cal(preNBR3NEW, dNBR5);//RBR based on new dNBR
+          var confidence5 = confidence_cal(dNBR5);//confidenece based on new dNBR
+          var offset_new5 =  dNBR_offset_cal (0,0, CollectionPre, CollectionPost, region,4);//offset based on new dNBR
+          var names5 = exportIndices(4,preNBR3NEW,postNBR3NEW,area4);//properties of new dNBR
+          //feeding indeces of this iteration as a list
+          dNBR_T =ee.List([dNBR1,dNBR2,dNBR3,dNBR4,dNBR5]).flatten();
+          names_T = ee.List([names1,names2,names3,names4,names5]).flatten();
+          confidence_T = ee.List([confidence1,confidence2,confidence3,confidence4,confidence5]).flatten();
+          RdNBR_T = ee.List([RdNBR1,RdNBR2,RdNBR3,RdNBR4,RdNBR5]).flatten();
+          offset_T = ee.List([offset_new1,offset_new2,offset_new3,offset_new4,offset_new5]).flatten();
+          dNBR_EVI_T = ee.List([dNBR_EVI1,dNBR_EVI2,dNBR_EVI3,dNBR_EVI4,dNBR_EVI5]).flatten();
+          RBR_T = ee.List([RBR1,RBR2,RBR3,RBR4,RBR5]).flatten();
+        }
+      }
+    }
+  }
+  //if there are more than 2 images in the pre-collection but there is only one image in the post-collection 
+  if (size_pre.gte(2).getInfo() && size_post.lt(2).getInfo()){
+    preNBR1NEW = NBR_cal_pre1(CollectionPre, 1);//calculating NBR of the image with second highes suitability
+    dNBR1 = dNBR_cal(preNBR1NEW, postNBR); // calculate the dNBR based on new preNBR and reference postNBR
+    dNBR1 = iteration_dNBR (dNBR1,dNBR); //mask new dNBR with ref dNBR (obtained from iteration 0)
+    area1 = areaCalculate(dNBR1); //calculate the area of the new dNBR
+    dNBR_EVI1 = dNBR_EVI_cal(CollectionPost,0,dNBR1); //calculating the dNBR-EVI index 
+    confidence1 = confidence_cal(dNBR1); //create the confidence raster of new dNBR1 
+    RdNBR1 = RdNBR_cal(preNBR1NEW, dNBR1);//calculate the new RdNBR1 
+    RBR1 = RBR_cal(preNBR1NEW, dNBR1);
+    offset_new1 =  dNBR_offset_cal (1,0, CollectionPre, CollectionPost, region,1);//calculate the offset based on the new dNBR with new pre 
+    names1 = exportIndices(1,preNBR1NEW,postNBR,area1); //create the name of first new dNBR based on properties of preNBR and postNBR used 
+    //feeding the new iterated indices
+    dNBR_T=ee.List([]);
+    names_T=ee.List([]);
+    confidence_T=ee.List([]);
+    RdNBR_T=ee.List([]);
+    offset_T=ee.List([]);
+    dNBR_EVI_T=ee.List([]);
+    RBR_T = ee.List([]);
+    dNBR_T= ee.List(dNBR_T).add(dNBR1);
+    names_T= ee.List(names_T).add(names1);
+    confidence_T= ee.List(confidence_T).add(confidence1);
+    RdNBR_T=ee.List(RdNBR_T).add(RdNBR1);
+    offset_T= offset_T.add(offset_new1);
+    dNBR_EVI_T=ee.List(dNBR_EVI_T).add(dNBR_EVI1);
+    RBR_T = ee.List(RBR_T).add(RBR1);
+  }
+  //if there is only one image in the pre-fire image collection but at least 2 images in post-fire image collection
+  if (size_pre.lt(2).getInfo() && size_post.gte(2).getInfo()){
+    postNBR1NEW = NBR_cal_post1(CollectionPost, 1); //calculating NBR of the image with second highes suitability
+    dNBR2 = dNBR_cal(preNBR, postNBR1NEW);// calculate the dNBR based on reference preNBR and new postNBR
+    dNBR2 = iteration_dNBR (dNBR2,dNBR);//mask new dNBR with ref dNBR (obtained from iteration 0)
+    area2 = areaCalculate(dNBR2);//calculate the area of the new dNBR 
+    dNBR_EVI2 = dNBR_EVI_cal(CollectionPost,1,dNBR2); //calculating the dNBR-EVI index
+    confidence2 = confidence_cal(dNBR2);//create the confidence raster of new dNBR2
+    RdNBR2 = RdNBR_cal(preNBR, dNBR2); //calculate the new RdNBR2 
+    RBR2 = RBR_cal(preNBR, dNBR2); //calculating new RBR2
+    offset_new2 =  dNBR_offset_cal (0,1, CollectionPre, CollectionPost, region,1);//calculate the offset based on the new dNBR with new post
+    names2 = exportIndices(1,preNBR,postNBR1NEW,area2); //create the name of second new dNBR based on properties of preNBR and postNBR used 
+    //feeding the new indices
+    dNBR_T=ee.List([]);
+    names_T=ee.List([]);
+    confidence_T=ee.List([]);
+    RdNBR_T=ee.List([]);
+    offset_T=ee.List([]);
+    dNBR_EVI_T=ee.List([]);
+    RBR_T = ee.List([]);
+    dNBR_T= ee.List(dNBR_T).add(dNBR2);
+    names_T= ee.List(names_T).add(names2);
+    confidence_T= ee.List(confidence_T).add(confidence2);
+    RdNBR_T=ee.List(RdNBR_T).add(RdNBR2);
+    offset_T= offset_T.add(offset_new2);
+    dNBR_EVI_T=ee.List(dNBR_EVI_T).add(dNBR_EVI2);
+    RBR_T = ee.List(RBR_T).add(RBR2);
+  }
+  return {//returning the iterated indices
+    dNBR:dNBR_T,
+    names: names_T,
+    confidence: confidence_T,
+    RdNBR: RdNBR_T,
+    offset: offset_T,
+    dNBR_EVI: dNBR_EVI_T,
+    RBR:RBR_T
+  };
+}
+//iteration for condition: intersected
+function iteration_pre_post_intersected(CollectionPre,CollectionPost, preNBR, postNBR,dNBR,area_original) {
+  //getting pre-fire images with coverage of at leat 80% and at least 5% cloudfree pixels, sorted from highest to lowest suitability 
+  CollectionPre = CollectionPre.filterMetadata('IMAGE_COVERAGE_PERCENTAGE','greater_than',80);
+  CollectionPre = CollectionPre.filterMetadata('CLOUD_COVERAGE_AOI','less_than',95);
+  CollectionPre = CollectionPre.sort("SUITABILITY",false);
+  var size_CollectionPre = CollectionPre.size();//getting the size of pre-fire image collection
+  //getting post-fire images with coverage of at leat 80% and at least 5% cloudfree pixels, sorted from highest to lowest suitability 
+  CollectionPost = CollectionPost.filterMetadata('IMAGE_COVERAGE_PERCENTAGE','greater_than',80);
+  CollectionPost = CollectionPost.filterMetadata('CLOUD_COVERAGE_AOI','less_than',95);
+  CollectionPost = CollectionPost.sort("SUITABILITY",false);
+  var size_CollectionPost = CollectionPost.size();//getting the size of post-fire image collection
+  var area1,offset_new1,offset_new2;
+  // both pre and post fire image collections have 2 or more than 2 image
+  if(size_CollectionPre.gte(2).getInfo() && size_CollectionPost.gte(2).getInfo()){
+    var preNBR1NEW = NBR_cal_pre1(CollectionPre, 1);//calculating preNBR of the image with second highes suitability
+    var postNBR1NEW = NBR_cal_post1(CollectionPost, 1); //calculating NBR of the image with second highes suitability
+    var dNBR1 = dNBR_cal(preNBR1NEW, postNBR1NEW);//calculate the dNBR with the pair of NBRs with the second highest suitability
+    dNBR1 = iteration_dNBR (dNBR1,dNBR); //mask the new dNBR with the ref dNBR (calculated from iteration 0)
+    var dNBRT = dNBR1;
+    var area2 = areaCalculate(dNBR1); //calculate the area of the new dNBRs
+    var dNBR_EVI1 = dNBR_EVI_cal(CollectionPost,1,dNBR1); //calculating the dNBR-EVI index (post image:iteration=1 and dNBR:iteration=1)
+    var dNBR_EVIT = dNBR_EVI1; //feeding the new dNBR_EVI
+    var confidence1 = confidence_cal(dNBR1);//calculate the confidence raster of the new dNBR
+    var confidence1T = confidence1; //just creating this variable to be filled if second iteration is nedded
+    var RdNBR1 = RdNBR_cal(preNBR1NEW, dNBR1); //calculate the RdNBR based on new preNBR and new dNBR
+    var RdNBR1T = RdNBR1;//just creating this variable to be filled if second iteration is nedded
+    var RBR1 = RBR_cal(preNBR1NEW, dNBR1);//calculate the RBR based on new preNBR and new dNBR
+    var RBR1T = RBR1;
+    var offset1 = dNBR_offset_cal (1,1, CollectionPre, CollectionPost, region,1);//calculate the offset based on the new dNBR with new pre and new post
+    var offset1T =offset1;
+    var names1 = exportIndices(1,preNBR1NEW,postNBR1NEW,area2); //create the name based on properties of new preNBR and new postNBR
+    names1 = ee.List([names1]); //converting names to list 
+    var names1T = names1; //just creating this variable to be filled if second iteration is nedded
+    var dNBRArea = areaCalculate(dNBR); //area of reference dNBR (ITERATION = 0)
+    var area1and2 = dNBRArea.add(area2); //areas of dNBRs from iteration 0 and 1
+    area1and2 = ee.Number(area1and2); //converting areas to number
+    area_original = ee.Number(area_original); //original area of the fire
+    var diff = area_original.subtract(area1and2); //difference of original area and areas of dNBRs
+    var pre_CCfree = CollectionPre.filterMetadata('CLOUD_COVERAGE_AOI','less_than',5); //filtering the pre-fire image collection to optimize the code to images with 5% or less cloud contamination % in AOI
+    var size_preCCfre = pre_CCfree.size();  //the size of filtered pre-fire image collection 
+    var post_CCfree = CollectionPost.filterMetadata('CLOUD_COVERAGE_AOI','less_than',5); //filtering the post-fire image collection to optimize the code to images with 5% or less cloud contamination % in AOI
+    var size_postCCfree = post_CCfree.size(); //the size of filtered post-fire image collection 
+    var pre_list = CollectionPre.toList(CollectionPre.size()); //pre fire image collection to list 
+    var coverage_2_pre = ee.Image(pre_list.get(1)).get('IMAGE_COVERAGE_PERCENTAGE'); //getting the coverage of the second best pre-fire image
+    coverage_2_pre = ee.Number(coverage_2_pre); //2nd best pre coverage into number
+    var post_list = CollectionPost.toList(CollectionPost.size()); //postfire image collection to list 
+    var coverage_2_post = ee.Image(post_list.get(1)).get('IMAGE_COVERAGE_PERCENTAGE');//getting the coverage of the second best post-fire image
+    coverage_2_post = ee.Number(coverage_2_post);//2nd best post coverage into number
+    // after the dNBR wih second best pair of pre and post, the remaning area without dNBR estimation is still larger than 70ha
+    if(diff.gte(70).getInfo()) {  
+      //there is also a pre-fire image available without any cloud
+      if( (size_preCCfre.neq(0).getInfo())&&(size_CollectionPre.gte(3).getInfo())){ 
+        var preNBR2NEW = NBR_cal_pre1(CollectionPre, 2);//calculating preNBR of the image with third highest suitability of pre
+        var con1 = preNBR2NEW.bandNames().contains("NBR"); //if the third best pre NBR exists ===con2
+        con1 = con1.getInfo();
+        var dNBR2 = dNBR_cal(preNBR2NEW, postNBR1NEW);//calculate the dNBR with the second iterated preNBR and first iterated postNBR
+        dNBR2 = iteration_dNBR (dNBR2,dNBR);//mask the new dNBR with the ref dNBR (calculated from iteration 0)
+        dNBR2 = iteration_dNBR (dNBR2,dNBR1);//mask the new dNBR with the first dNBR (calculated from iteration 1)
+        var area3 = areaCalculate(dNBR2); //calculate the area of the new dNBR
+        // if post-fire collection has more than 3 images
+        if(size_CollectionPost.gte(3).getInfo()){ 
+          var  postNBR2NEW = NBR_cal_post1(CollectionPost, 2); //postNBR from third best image 
+          var con2 = postNBR2NEW.bandNames().contains("NBR"); //check if it exists --> con2 === true
+          con2 = con2.getInfo();
+        } else {
+          con2 = false; //if it does not exists --> con2 === false
+        }
+        var dNBR_EVI2 = dNBR_EVI_cal(CollectionPost,1,dNBR2); //calculating the dNBR-EVI index (post image:iteration=1 and dNBR:iteration=2)
+        var confidence2 = confidence_cal(dNBR2);//calculate the confidence raster of the new dNBR
+        var RdNBR2 = RdNBR_cal(preNBR2NEW, dNBR2); //calculate the RdNBR based on new preNBR and new dNBR
+        var RBR2 = RBR_cal(preNBR2NEW, dNBR2);
+        dNBRT =ee.List([dNBR1,dNBR2]); //feed the new dNBR
+        dNBR_EVIT = ee.List([dNBR_EVI1,dNBR_EVI2]); //feeding the new dNBR_EVI
+        confidence1T = ee.List([confidence1,confidence2]);//feed the new confidence
+        RdNBR1T = ee.List([RdNBR1,RdNBR2]); ////feed the new RdNBR
+        RBR1T = ee.List([RBR1,RBR2]);
+        var offset2 = dNBR_offset_cal (2,1, CollectionPre, CollectionPost, region,2);//calculate the offset based on the new dNBR with new pre and new post
+        var names2 = exportIndices(2,preNBR2NEW,postNBR1NEW,area3); //create the name based on properties of new preNBR and old postNBR
+        names2 = ee.List([names2]); //converting names to list 
+        offset1T = ee.List([offset1,offset2]);
+        names1T = ee.List([names1,names2]).flatten();//feed the new name
+        if (area3.getInfo() === 0 && con1 && con2){
+          var dNBR4 = dNBR_cal(preNBR2NEW, postNBR2NEW);
+          dNBR4 = iteration_dNBR (dNBR4,dNBR);
+          dNBR4 = iteration_dNBR (dNBR4,dNBR1);
+          var area5 = areaCalculate(dNBR4);
+          var dNBR_EVI4 = dNBR_EVI_cal(CollectionPost,2,dNBR4);
+          var confidence4 = confidence_cal(dNBR4);//calculate the confidence raster of the new dNBR
+          var RdNBR4 = RdNBR_cal(preNBR2NEW, dNBR4); //calculate the RdNBR based on new preNBR and new dNBR
+          var RBR4 = RBR_cal(preNBR2NEW, dNBR4);
+          dNBRT =ee.List([dNBR1,dNBR4]); //feed the new dNBR
+          dNBR_EVIT = ee.List([dNBR_EVI1,dNBR_EVI4]); //feeding the new dNBR_EVI
+          confidence1T = ee.List([confidence1,confidence4]);//feed the new confidence
+          RdNBR1T = ee.List([RdNBR1,RdNBR4]); //feed the new RdNBR
+          RBR1T = ee.List([RBR1,RBR4]);
+          var offset4 = dNBR_offset_cal (2,2, CollectionPre, CollectionPost, region,4);//calculate the offset based on the new dNBR with new pre and new post
+          var names4 = exportIndices(4,preNBR2NEW,postNBR2NEW,area5); //create the name based on properties of new preNBR and old postNBR
+          names4 = ee.List([names4]); //converting names to list 
+          offset1T = ee.List([offset1,offset4]);
+          names1T = ee.List([names1,names4]).flatten();//feed the new names
+        }
+        diff = area_original.subtract(area1and2.add(area3));
+      }   
+      //there is also a post-fire image available without any cloud
+      if ((size_postCCfree.neq(0).getInfo())&&(size_CollectionPost.gte(3).getInfo()) && diff.gte(70).getInfo()) { 
+        postNBR2NEW = NBR_cal_post1(CollectionPost, 2); //calculating NBR of the image with second highest suitability of post
+        var dNBR3 = dNBR_cal(preNBR1NEW, postNBR2NEW);//calculate the dNBR with the second iterated preNBR and first iterated postNBR
+        dNBR3 = iteration_dNBR (dNBR3,dNBR);//mask the new dNBR with the ref dNBR (calculated from iteration 0)
+        dNBR3 = iteration_dNBR (dNBR3,dNBR1);//mask the new dNBR with the first dNBR (calculated from iteration 1) 
+        var area4 = areaCalculate(dNBR3); //calculate the area of the new dNBR
+        var dNBR_EVI3 = dNBR_EVI_cal(CollectionPost,2,dNBR3); //calculating the dNBR-EVI index (post image:iteration=2 and dNBR:iteration=2)
+        var confidence3 = confidence_cal(dNBR3);//calculate the confidence raster of the new dNBR
+        var RdNBR3 = RdNBR_cal(preNBR1NEW, dNBR3); //calculate the RdNBR based on new preNBR and new dNBR
+        var RBR3 = RBR_cal(preNBR1NEW, dNBR3);
+        dNBRT =ee.List([dNBR1,dNBR3]); //feed the new dNBR
+        dNBR_EVIT = ee.List([dNBR_EVI1,dNBR_EVI3]); //feeding the new dNBR_EVI
+        confidence1T = ee.List([confidence1,confidence3]);//feed the new confidence
+        RdNBR1T = ee.List([RdNBR1,RdNBR3]); //feed the new RdNBR
+        RBR1T = ee.List([RBR1,RBR3]); 
+        var offset3 = dNBR_offset_cal (1,2, CollectionPre, CollectionPost, region,3);//calculate the offset based on the new dNBR with new pre and new post
+        var names3 = exportIndices(3,preNBR1NEW,postNBR2NEW,area4); //create the name based on properties of new preNBR and old postNBR
+        names3 = ee.List([names3]); //converting names to list 
+        offset1T = ee.List([offset1,offset3]);
+        names1T = ee.List([names1,names3]).flatten();//feed the new names
+        var diff1 = area_original.subtract(area4.add(area1and2)); // area remaining after dNBR-ref, dNBR1 and dNBR3
+        if(diff1.gte(70).getInfo()){ //if the remaining area is stil larger than 70ha
+        //filter both pre and post image collections to images with coverages og equal and more than 99 % and cloud cover within BA less than 10%
+          CollectionPre = CollectionPre.filterMetadata('IMAGE_COVERAGE_PERCENTAGE','greater_than',99);
+          CollectionPre = CollectionPre.filterMetadata('CLOUD_COVERAGE_AOI','less_than',10);
+          CollectionPost = CollectionPost.filterMetadata('CLOUD_COVERAGE_AOI','less_than',10);
+          CollectionPost = CollectionPost.filterMetadata('IMAGE_COVERAGE_PERCENTAGE','greater_than',99);
+          var size1 = CollectionPre.size(); //size of refiltred pre-fire imagecollection
+          var size2 = CollectionPost.size();//size of refiltred post-fire imagecollection
+          if (size1.gte(1).getInfo() & size2.gte(1).getInfo()){ //there are at least one almost fully covering cloudfree pre and  almost fully covering cloudfree post image
+            var preNBR3NEW = NBR_cal_post1(CollectionPre, 0); //best refiltered pre 
+            var postNBR3NEW = NBR_cal_post1(CollectionPost, 0); //best refiltered post 
+            var dNBR5 = dNBR_cal(preNBR3NEW, postNBR3NEW); //dNBR based on best refiltred pair
+            dNBR5 = iteration_dNBR (dNBR5,dNBR); //masking with dNBR ref
+            dNBR5 = iteration_dNBR (dNBR5,dNBR1);//masking with dNBR  1
+            dNBR5 = iteration_dNBR (dNBR5,dNBR2);//masking with dNBR 2
+            dNBR5 = iteration_dNBR (dNBR5,dNBR3);//masking with dNBR 3
+            var area6 = areaCalculate(dNBR5); //calculate the area of the new dNBR
+            var dNBR_EVI5 = dNBR_EVI_cal(CollectionPost,0,dNBR5); //calculating the dNBR-EVI index (post image:iteration=2 and dNBR:iteration=2)
+            var confidence5 = confidence_cal(dNBR5);//calculate the confidence raster of the new dNBR
+            var RdNBR5 = RdNBR_cal(preNBR3NEW, dNBR5); //calculate the RdNBR based on new preNBR and new dNBR
+            var RBR5 = RBR_cal(preNBR3NEW, dNBR5);//calculate the RBR based on new preNBR and new dNBR
+            dNBRT =ee.List([dNBR1,dNBR3,dNBR5]); //feed the new dNBR
+            dNBR_EVIT = ee.List([dNBR_EVI1,dNBR_EVI3,dNBR_EVI5]); //feeding the new dNBR_EVI
+            confidence1T = ee.List([confidence1,confidence3,confidence5]);//feed the new confidence
+            RdNBR1T = ee.List([RdNBR1,RdNBR3,RdNBR5]); //feed the new RdNBR
+            RBR1T = ee.List([RBR1,RBR3,RBR5]); 
+            var offset5 = dNBR_offset_cal (0,0, CollectionPre, CollectionPost, region,4);//calculate the offset based on the new dNBR with new pre and new post
+            var names5 = exportIndices(4,preNBR3NEW,postNBR3NEW,area6); //create the name based on properties of new preNBR and old postNBR
+            names5 = ee.List([names5]); //converting names to list 
+            offset1T = ee.List([offset1,offset3,offset5]);
+            names1T = ee.List([names1,names3,names5]).flatten();//feed the new names
+          }
+        }
+        if (area4.getInfo() === 0 && con1 && con2){
+          dNBR4 = dNBR_cal(preNBR2NEW, postNBR2NEW); //dNBR with 3rd best pre and 3rd best post
+          dNBR4 = iteration_dNBR (dNBR4,dNBR); //masking with dNBR ref 
+          dNBR4 = iteration_dNBR (dNBR4,dNBR1); //masking with dNBR1
+          area5 = areaCalculate(dNBR4); //area of dNBR4
+          dNBR_EVI4 = dNBR_EVI_cal(CollectionPost,2,dNBR4);
+          confidence4 = confidence_cal(dNBR4);//calculate the confidence raster of the new dNBR
+          RdNBR4 = RdNBR_cal(preNBR2NEW, dNBR4); //calculate the RdNBR based on new preNBR and new dNBR
+          RBR4 = RBR_cal(preNBR2NEW, dNBR4); //RBR with dNBR4
+          dNBRT =ee.List([dNBR1,dNBR4]); //feed the new dNBR
+          dNBR_EVIT = ee.List([dNBR_EVI1,dNBR_EVI4]); //feeding the new dNBR_EVI
+          confidence1T = ee.List([confidence1,confidence4]);//feed the new confidence
+          RdNBR1T = ee.List([RdNBR1,RdNBR4]); //feed the new RdNBR
+          RBR1T =  ee.List([RBR1,RBR4]); //feeding all RBRs
+          offset4 = dNBR_offset_cal (2,2, CollectionPre, CollectionPost, region,4);//calculate the offset based on the new dNBR with new pre and new post
+          names4 = exportIndices(4,preNBR2NEW,postNBR2NEW,area5); //create the name based on properties of new preNBR and old postNBR
+          names4 = ee.List([names4]); //converting names to list 
+          offset1T = ee.List([offset1,offset4]);
+          names1T = ee.List([names1,names4]).flatten();//feed the new names
+        }
+      } 
+      //the coverages of both second best pre and post are less than 95%
+      if(coverage_2_pre.lt(95).getInfo() || coverage_2_post.lt(95).getInfo() ){
+        CollectionPre = CollectionPre.filterMetadata('IMAGE_COVERAGE_PERCENTAGE','greater_than',95);
+        CollectionPre = CollectionPre.filterMetadata('CLOUD_COVERAGE_AOI','less_than',5);
+        CollectionPre = CollectionPre.sort("SUITABILITY",false);
+        // print(CollectionPre,'CollectionPre_new')
+        CollectionPost = CollectionPost.filterMetadata('IMAGE_COVERAGE_PERCENTAGE','greater_than',95);
+        CollectionPost = CollectionPost.filterMetadata('CLOUD_COVERAGE_AOI','less_than',5);
+        CollectionPost = CollectionPost.sort("SUITABILITY",false);
+        var preNBR11NEW = NBR_cal_pre1(CollectionPre, 1);
+        var postNBR11NEW = NBR_cal_post1(CollectionPost, 1);
+        var dNBR11 = dNBR_cal(preNBR11NEW, postNBR11NEW);//calculate the dNBR with the pair of NBRs with the second highest suitability
+        dNBR11 = iteration_dNBR (dNBR11,dNBR);//masking with dNBR ref
+        dNBR11 = iteration_dNBR (dNBR11,dNBR1);//masking with dNBR1
+        dNBRT = ee.List([dNBR1,dNBR11]); //feeding dNBRs
+        var area11 = areaCalculate(dNBR11); //calculate the area of the new dNBRs
+        var dNBR_EVI11 = dNBR_EVI_cal(CollectionPost,1,dNBR11); //calculating the dNBR-EVI index (post image:iteration=1 and dNBR:iteration=1)
+        dNBR_EVIT =  ee.List([dNBR_EVI1,dNBR_EVI11]); //feeding dNBR-EVIs
+        var confidence11 = confidence_cal(dNBR11);//calculate the confidence raster of the new dNBR
+        confidence1T = ee.List([confidence1,confidence11]); //feeding confidences
+        var RdNBR11 = RdNBR_cal(preNBR11NEW, dNBR11); //calculate the RdNBR based on new preNBR and new dNBR
+        var RBR11 = RBR_cal(preNBR11NEW, dNBR11); //calculate the RBR based on new preNBR and new dNBR
+        RdNBR1T = ee.List([RdNBR1,RdNBR11]); //feeding RdNBRs 
+        RBR1T = ee.List([RBR1,RBR11]);  //feeding RBRs
+        var offset11 = dNBR_offset_cal (1,1, CollectionPre, CollectionPost, region,2); //offset calculatiom
+        offset1T = ee.List([offset1,offset11]); //feeding offset
+        var names11 = exportIndices(2,preNBR11NEW,postNBR11NEW,area11); //create the name based on properties of new preNBR and new postNBR
+        names11 = ee.List([names11]); //names to list
+        names1T = ee.List([names1,names11]).flatten(); ////feeding names
+      } 
+    }
+  } 
+  //the size of pre-fire image collection is equal or larger than 2 but there is only one post-fire image 
+  if (size_CollectionPre.gte(2).getInfo() && size_CollectionPost.lt(2).getInfo()){
+    preNBR1NEW = NBR_cal_pre1(CollectionPre, 1);//calculating NBR of the image with second highes suitability
+    dNBR1 = dNBR_cal(preNBR1NEW, postNBR); // calculate the dNBR based on new preNBR and reference postNBR
+    dNBR1 = iteration_dNBR (dNBR1,dNBR); //mask new dNBR with ref dNBR (obtained from iteration 0)
+    area1 = areaCalculate(dNBR1); //calculate the area of the new dNBR
+    dNBR_EVI1 = dNBR_EVI_cal(CollectionPost,0,dNBR1); //calculating the dNBR-EVI index 
+    confidence1 = confidence_cal(dNBR1); //create the confidence raster of new dNBR1 
+    RdNBR1 = RdNBR_cal(preNBR1NEW, dNBR1);//calculate the new RdNBR1 
+    RBR1 = RBR_cal(preNBR1NEW, dNBR1);
+    offset_new1 =  dNBR_offset_cal (1,0, CollectionPre, CollectionPost, region,1);//calculate the offset based on the new dNBR with new pre 
+    names1 = exportIndices(1,preNBR1NEW,postNBR,area1); //create the name of first new dNBR based on properties of preNBR and postNBR used 
+    //feeding the iterated indices
+    dNBRT=ee.List([]);
+    names1T=ee.List([]);
+    confidence1T=ee.List([]);
+    RdNBR1T=ee.List([]);
+    offset1T=ee.List([]);
+    dNBR_EVIT=ee.List([]);
+    RBR1T = ee.List([]);
+    dNBRT= ee.List(dNBRT).add(dNBR1);
+    names1T= ee.List(names1T).add(names1);
+    confidence1T= ee.List(confidence1T).add(confidence1);
+    RdNBR1T=ee.List(RdNBR1T).add(RdNBR1);
+    offset1T= offset1T.add(offset_new1);
+    dNBR_EVIT=ee.List(dNBR_EVIT).add(dNBR_EVI1);
+    RBR1T=ee.List(RBR1T).add(RBR1);
+  }
+  // there is only one pre-fire image but there are 2 or more post-fire images 
+  if (size_CollectionPre.lt(2).getInfo() && size_CollectionPost.gte(2).getInfo()){
+    postNBR1NEW = NBR_cal_post1(CollectionPost, 1); //calculating NBR of the image with second highes suitability
+    dNBR2 = dNBR_cal(preNBR, postNBR1NEW);// calculate the dNBR based on reference preNBR and new postNBR
+    dNBR2 = iteration_dNBR (dNBR2,dNBR);//mask new dNBR with ref dNBR (obtained from iteration 0)
+    area2 = areaCalculate(dNBR2);//calculate the area of the new dNBR 
+    dNBR_EVI2 = dNBR_EVI_cal(CollectionPost,1,dNBR2); //calculating the dNBR-EVI index
+    confidence2 = confidence_cal(dNBR2);//create the confidence raster of new dNBR2
+    RdNBR2 = RdNBR_cal(preNBR, dNBR2); //calculate the new RdNBR2 
+    RBR2 = RBR_cal(preNBR, dNBR2);
+    offset_new2 =  dNBR_offset_cal (0,1, CollectionPre, CollectionPost, region,1);//calculate the offset based on the new dNBR with new post
+    names2 = exportIndices(1,preNBR,postNBR1NEW,area2); //create the name of second new dNBR based on properties of preNBR and postNBR used 
+    //feeding the iterated indices
+    dNBRT=ee.List([]);
+    names1T=ee.List([]);
+    confidence1T=ee.List([]);
+    RdNBR1T=ee.List([]);
+    offset1T=ee.List([]);
+    dNBR_EVIT=ee.List([]);
+    RBR1T = ee.List([]);
+    dNBRT= ee.List(dNBRT).add(dNBR2);
+    names1T= ee.List(names1T).add(names2);
+    confidence1T= ee.List(confidence1T).add(confidence2);
+    RdNBR1T=ee.List(RdNBR1T).add(RdNBR2);
+    offset1T= offset1T.add(offset_new2);
+    dNBR_EVIT=ee.List(dNBR_EVIT).add(dNBR_EVI2);
+    RBR1T=ee.List(RBR1T).add(RBR2);
+  }
+  return { //returning the dNBR, the names, confidence raster, and RdNBR
+    dNBR:dNBRT,
+    names: names1T,
+    confidence: confidence1T,
+    RdNBR: RdNBR1T,
+    offset:offset1T,
+    dNBR_EVI: dNBR_EVIT,
+    RBR: RBR1T
+  };
+}
+//via the condition choosing which iteration function to use 
+function iterationS (con){ //feeding the condition as the input variable 
+  var round1; //the output of the function which can change within each if statement 
+  var index = ee.Algorithms.If(con.condition,(con.trueConditions).get(0),'null'); //getting the name of the condition(pre or post or intersected, or not_intersected)
+  index = ee.String(index); //converting the name of the condition into a string from computedobject(GEE optimization)
+  var condpre = index.compareTo('pre'); //check if the condition is pre(=pre-fire image doesn't cover the entire area of AOI)
+  var condpost = index.compareTo('post');//check if the condition is post(=post-fire image doesn't cover the entire area of AOI)
+  var condNOinter = index.compareTo('not_intersected'); //check if the condition is not-intersected(= both pre-fire & post-fire image don't cover the entire area of AOI but they do not intersect)
+  var condinter = index.compareTo('intersected'); //check if the condition is intersected(= both pre-fire & post-fire image don't cover the entire area of AOI and they intersect)
+  condpre =ee.Algorithms.If(condpre.eq(0),true,false); //converting the condition name to true or false statments 
+  condpost = ee.Algorithms.If(condpost.eq(0),true,false); //converting the condition name to true or false statments
+  condNOinter = ee.Algorithms.If(condNOinter.eq(0),true,false); //converting the condition name to true or false statments
+  condinter = ee.Algorithms.If(condinter.eq(0),true,false);//converting the condition name to true or false statments
+  if (condpre.getInfo()){ //whenever the 'pre' condition is true
+    round1 =  iteration_pre_whole(CollectionPre, preNBR, postNBR,CollectionPost); //using the function to iterate the pre-fire image while keeping the post-fire image constant/reference
+  } 
+  if (condpost.getInfo()){//whenever the 'post' condition is true
+    round1 = iteration_post_whole(CollectionPost, preNBR, postNBR);//using the function to iterate the post-fire image while keeping the pre-fire image constant/reference
+  } 
+  if (condNOinter.getInfo()){ //whenever the 'not_intersected' condition is true
+    round1 = iteration_pre_post_not_intersected(CollectionPre,CollectionPost, preNBR, postNBR,dNBR); //using the function to iterate either post-fire image & and keeping the pre-fire constant/reference and vise versa 
+  } 
+  if (condinter.getInfo()){//whenever the 'intersected' condition is true
+    round1 = iteration_pre_post_intersected(CollectionPre,CollectionPost, preNBR, postNBR,dNBR,area_original);//using the function to iterate both post-fire image & pre-fire images
+  }
+  return round1; //returning the output of the function based on each condition 
+}
+//converting the list of details into a dictionary
+function name2dictionary (item) {
+  item = ee.String(item); //get the items off the list and make them into string
+  var parts = item.split("_"); // Split the string by underscore
+  var dictionary = { //get the parts of the string representing the specifications
+    Iteration: parts.get(0),
+    Fire_i: parts.get(2),
+    Year: parts.get(3), 
+    ID: parts.get(4),
+    preTL:parts.get(6),
+    preCC: parts.get(8),
+    preSuitability: parts.get(10),
+    postTL:parts.get(12), 
+    postCC:parts.get(14), 
+    postSuit: parts.get(16), 
+    dNBRarea:parts.get(18), 
+    firearea: parts.get(20), 
+    Confidence: parts.get(22)
+  };
+  return dictionary;
+}
+//converting the calculated offset as a string into a dictionary
+function offsets2dictionary(item){
+  item = ee.String(item); //get the items off the list and make them into string
+  var parts = item.split("_");  // Split the string by underscore
+  var dictionary = { //get the parts of the string representing the specifications
+    Iteration: parts.get(0),
+    Fire_i: parts.get(2),
+    Year: parts.get(3), 
+    dNBROffset: parts.get(5), 
+    RdNBROffset: parts.get(7), 
+    RBROffset: parts.get(9), 
+    dNBR_EVIoffset:parts.get(12)
+  };
+  return dictionary
+}
+//dictionary to feature
+function name2FC(dictionary) {
+  return ee.Feature(null, dictionary); 
+}
+//conversion of date format of 1984 to 2000 shapefile
+function reformatting_dates(feature) {
+  var millis = ee.Number(feature.get("Data_ini")); //  "Data_ini" === start date of the fire
+  var date = ee.Date(millis); //convert the number as a milliseconds (confirmation)
+  var formattedDate = date.format("yyyy-MM-dd"); //converting milliseconds to yyyy-MM-dd format 
+  var millis1 = ee.Number(feature.get("Data_end")); // "Data_ini" === end date of the fire
+  var date1 = ee.Date(millis1);//convert the number as a milliseconds (confirmation)
+  var formattedDate1 = date1.format("yyyy-MM-dd"); //converting milliseconds to yyyy-MM-dd format 
+  return feature.set({"Data_ini":formattedDate,"Data_end":formattedDate1});//in the field the formatted version being inserted
+}
+
+//******************************************************************************************
+
+//.........................................................................................//
+//                                                                                         //
+//                                                                                         //
+//                                     "For each year"                                     //
+//                                                                                         //
+//                                                                                         //
+//.........................................................................................//
+
+// applying the loop based on the year in which each fire burnt based on the input shapefile
+for (var year = 1984; year <= 2022; year++) {
+  //variables to be filled within each iteration for each year
+  var fc;
+  var dNBR_all =ee.List([]);
+  var dNBR_all_size = [];
+  var dNBR_all_size1 = [];
+  var fire_all_size = [];
+  var dNBR_names = ee.List([]);
+  var list_fires = ee.List([]);
+  var RdNBR_all =ee.List([]);
+  var dNBR_EVI_all = ee.List([]);
+  var confidence_all=ee.List([]);
+  var RBR_all = ee.List([]);
+  var offsets_all = ee.List([]);
+  if (year> 2000){ //table = shapefile of fires from 2001 to 2022
+    fc = (table);
+  } else if (year<=2000){
+    fc = (table2); //table2 = shapefile of fires from 1984 to 2000
+    fc = ee.FeatureCollection(fc).map(reformatting_dates); // the dates in this shapefile are in the format of milliseconds, and now they are converted into yyyy-MM-dd format
+  }
+  var FC1 = ee.FeatureCollection(fc); //converting the table into featurecollection
+  FC1 = FC1.filter(ee.Filter.eq('Year', year)); //filtering the shapefile based on the year 
+  var columnToSum = "area_ha";//getting the column containing the size of each fire(ha)
+  // Calculate the sum of the areas
+  var sum = FC1.reduceColumns({
+    reducer: ee.Reducer.sum(),
+    selectors: [columnToSum]
+  });
+  // Get the sum of burnt area (allburnt areas)
+  var sumValue = sum.get('sum');
+  // print(sumValue,year +':sum_total_area'); //printing the total area(internal checkup)
+  fc = fc.filter(ee.Filter.greaterThanOrEquals("area_ha",100)); //area_ha = the propertry of fire size in ha in the shapefile (column in the atribute table),filtering fires larger than 100ha 
+  //valid fires 
+  fc = fc.filter(ee.Filter.eq('Year', year)); //filtering the shapefile based on the year 
+  // fc = fc.filter(ee.Filter.eq('ID', '0585')); //filtering the shapefile based on the year 
+  fc = fc.filter(ee.Filter.neq("Data_ini",'')); //filtering the shapefile based on the start date of the fire
+  fc = fc.filter(ee.Filter.neq("Data_end",'')); //filtering the shapefile based on the end date of the fire
+  fc = fc.filter(ee.Filter.neq("Data_ini",'NaN')); //filtering the shapefile based on the fires with no start dates
+  fc = fc.filter(ee.Filter.neq("Data_end",'NaN')); //filtering the shapefile based on the fires with no start dates
+  var ic_pre; // imagecollection to feed the pre-fire images
+  var ic_post;// imagecollection to feed the post-fire images
+  var size_fc =fc.size().getInfo(); //the size of the filtered shapefile (filtered to only valid fires with start and end date, the fire size,and fire year)
+  //.........................................................................................//
+  //                                                                                         //
+  //                                                                                         //
+  //                                     "For each fire"                                     //
+  //                                                                                         //
+  //                                                                                         //
+  //.........................................................................................//
+  
+  for (var i = 0; i<size_fc; i++){ //each fire 
+    var list = fc.toList(fc.size()); //converting the shapefile into list 
+    fire = ee.Feature(list.get(i)); //getting the ith fire(individullay)
+    region = ee.FeatureCollection(fire); //converting the individual fire to FeatureCollection (GEE optimization)
+    var empty = ee.Image().byte(); //creating the empty space to create the border of the fire for visualization purposed (internal check up)
+    var outline = empty.paint({ //creating the fire border 
+      featureCollection: region,
+      color: 1,
+      width: 4
+    });
+    var start_date,start_firewithone,end_date,endwithmargin,post_date,pre_date,id,area_original; //variables which alter based on the fire year within the if statements 
+    start_date = ee.String(fire.get('Data_ini')); //get the start date 
+    start = ee.Date.parse('yyyy-MM-dd',start_date, 'GMT'); //parse the date into a readable format by GEE
+    start_firewithone = start.advance(-1, 'day'); //to prevent capturing the image while the fire is burning(nontheless the start hour of the fire)-->applying one day( one day before start date)
+    pre_date = start.advance(-110, 'day'); // the duration before the start date (period window) to look for pre-fire images
+    end_date = ee.String(fire.get('Data_end')); //getting the end date of the fire 
+    end = ee.Date.parse('yyyy-MM-dd',end_date, 'GMT'); //parse the date into a readable format by GEE
+    endwithmargin = end.advance(3,'day'); //to prevent capturing the image while the fire is burning(nontheless the end hour of the fire) & preventing the capture of smoke -->applying 3 days( 3days after end date)
+    post_date = end.advance(110, 'day'); // the duration after the end date (period window) to look for post-fire images
+    id = ee.String(fire.get('ID')); //getting the fire ID from the shapefile
+    area = fire.get("area_ha"); //getting the size of the fire in ha from the shapefile
+    area_original = fire.get("area_ha"); //renaming it to have the original size for further comparison reasons 
+    fire_all_size [i] = area_original; //feeding the original size of the valid fire into one variable 
+    //pre-fire image collection
+    var criteriaPre = ee.Filter.and( //filtering criteria based on the start date and period window to look for pre-fire images 
+      ee.Filter.bounds(region), ee.Filter.date(pre_date, start_firewithone));
+    if (year>=1984 & year <=2001){ //for fires burnt in 1984 to 2001 using LANDSAT 5 images 
+        ic_pre = ee.ImageCollection('LANDSAT/LT05/C02/T1_L2').map(rescale).map(new_properties_pre).map(suitability_img); //applying functions so each image has 'TIMELAG','CLOUD_COVERAGE_AOI','IMAGE_COVERAGE_PERCENTAGE', and 'SUITABILITY' properties 
+      } else if (year === 2002){ //for fires burnt in 2002 using LANDSAT 7 images 
+        ic_pre = ee.ImageCollection('LANDSAT/LE07/C02/T1_L2').map(rescale).map(new_properties_pre).map(suitability_img); //applying functions so each image has 'TIMELAG','CLOUD_COVERAGE_AOI','IMAGE_COVERAGE_PERCENTAGE', and 'SUITABILITY' properties 
+      } else if (year >= 2003 & year<= 2011){ //for fires burnt in 2003 to 2011 using LANDSAT 5 images 
+        ic_pre = ee.ImageCollection('LANDSAT/LT05/C02/T1_L2').map(rescale).map(new_properties_pre).map(suitability_img);//applying functions so each image has 'TIMELAG','CLOUD_COVERAGE_AOI','IMAGE_COVERAGE_PERCENTAGE', and 'SUITABILITY' properties 
+      } else if (year === 2012){ //for fires burnt in 2012 using MODIS(500m resolution) images 
+        ic_pre = ee.ImageCollection('MODIS/006/MOD09A1').map(new_properties_pre).map(suitability_img); //applying functions so each image has 'TIMELAG','CLOUD_COVERAGE_AOI','IMAGE_COVERAGE_PERCENTAGE', and 'SUITABILITY' properties 
+      } else if (year >= 2013 & year<=2022){ //for fires burnt in 2013 to 2022 using LANDSAT 8 images 
+        ic_pre = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2').map(rescale).map(new_properties_pre).map(suitability_img);//applying functions so each image has 'TIMELAG','CLOUD_COVERAGE_AOI','IMAGE_COVERAGE_PERCENTAGE', and 'SUITABILITY' properties 
+      } else { //any other year --> invalid year --> throw error (internal check up)
+      throw new Error('Invalid year:'+ year);
+    }
+    //post-fire image collection
+    var criteriaPost = ee.Filter.and( //filtering criteria based on the end date and period window to look for post-fire images 
+      ee.Filter.bounds(region), ee.Filter.date(endwithmargin, post_date));
+    if (year>=1984 & year <=2001){ //for fires burnt in 1984 to 2001 using LANDSAT 5 images 
+      ic_post = ee.ImageCollection('LANDSAT/LT05/C02/T1_L2').map(rescale).map(new_properties_post).map(suitability_img);//applying functions so each image has 'TIMELAG','CLOUD_COVERAGE_AOI','IMAGE_COVERAGE_PERCENTAGE', and 'SUITABILITY' properties 
+    } else if (year === 2002){ //for fires burnt in 2002 using LANDSAT 7 images 
+      ic_post = ee.ImageCollection('LANDSAT/LE07/C02/T1_L2').map(rescale).map(new_properties_post).map(suitability_img);//applying functions so each image has 'TIMELAG','CLOUD_COVERAGE_AOI','IMAGE_COVERAGE_PERCENTAGE', and 'SUITABILITY' properties 
+    } else if (year >= 2003 & year<= 2011){ //for fires burnt in 2003 to 2011 using LANDSAT 5 images 
+      ic_post = ee.ImageCollection('LANDSAT/LT05/C02/T1_L2').map(rescale).map(new_properties_post).map(suitability_img);//applying functions so each image has 'TIMELAG','CLOUD_COVERAGE_AOI','IMAGE_COVERAGE_PERCENTAGE', and 'SUITABILITY' properties 
+    } else if (year === 2012){//for fires burnt in 2012 using MODIS(500m resolution) images
+      ic_post = ee.ImageCollection('MODIS/006/MOD09A1').map(new_properties_post).map(suitability_img);//applying functions so each image has 'TIMELAG','CLOUD_COVERAGE_AOI','IMAGE_COVERAGE_PERCENTAGE', and 'SUITABILITY' properties 
+    } else if (year >= 2013 & year<=2022){ //for fires burnt in 2013 to 2022 using LANDSAT 8 images 
+      ic_post = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2').map(rescale).map(new_properties_post).map(suitability_img);//applying functions so each image has 'TIMELAG','CLOUD_COVERAGE_AOI','IMAGE_COVERAGE_PERCENTAGE', and 'SUITABILITY' properties 
+    } else { //any other year --> invalid year --> throw error (internal check up)
+    throw new Error('Invalid year:'+ year);
+    }
+    try{ //used to catch the error so the code doesn't freeze up
+      var CollectionPre = ic_pre.filter(criteriaPre); //Pre-fire image collection
+      var area_pre = areaCalculate(ee.Image(CollectionPre.first()));
+      CollectionPre = ee.ImageCollection(CollectionPre).map(new_properties_pre).map(suitability_img); //for any image in the pre-fire collection, there is a 'TIMELAG','CLOUD_COVERAGE_AOI','IMAGE_COVERAGE_PERCENTAGE', and 'SUITABILITY'
+      CollectionPre = CollectionPre.filterMetadata('IMAGE_COVERAGE_PERCENTAGE','greater_than',80);//only images which cover 80% of AOI
+      CollectionPre = CollectionPre.filterMetadata('CLOUD_COVERAGE_AOI','less_than',90);//only images which cloud contamination less than 90% (at leat 5% of AOI is cloudfree)
+      CollectionPre = CollectionPre.sort("SUITABILITY",false);
+      var size_CollectionPre = CollectionPre.size(); //get the number of images available in pre collection
+      var CollectionPost = ic_post.filter(criteriaPost); //post-fire image collection
+      CollectionPost = ee.ImageCollection(CollectionPost).map(new_properties_post).map(suitability_img); //for any image in the post-fire collection, there is a 'TIMELAG','CLOUD_COVERAGE_AOI','IMAGE_COVERAGE_PERCENTAGE', and 'SUITABILITY'
+      CollectionPost = CollectionPost.filterMetadata('IMAGE_COVERAGE_PERCENTAGE','greater_than',80);//only images which cover 80% of AOI
+      CollectionPost = CollectionPost.filterMetadata('CLOUD_COVERAGE_AOI','less_than',90);//only images which cloud contamination less than 90% (at leat 5% of AOI is cloudfree)
+      CollectionPost = CollectionPost.sort("SUITABILITY",false);
+      var size_CollectionPost = CollectionPost.size();//get the number of images available in post collection
+      if (size_CollectionPre.eq(0).getInfo() || size_CollectionPost.eq(0).getInfo()){ //if there is no image in either of collection, then break the loop and go to next i++
+        print(i+':neither pre nor post image-->continue');
+        continue;
+      }
+      preNBR = NBR_cal_pre1(CollectionPre, 0); //calculation the preNBR for the first image (sorted collection--> first image = image with highest suitability)
+      postNBR = NBR_cal_post1(CollectionPost,0); //calculating the postNBR for the first image (sorted collection--> first image = image with highest suitability)
+      con1 = preNBR.bandNames().contains("NBR"); //check if there is a preNBR image for this fire
+      con2 = postNBR.bandNames().contains("NBR"); //check if there is a postNBR image for this fire
+      if (con1.getInfo()||con2.getInfo()){ //if there is both pre & post NBR images for this fire 
+        dNBR = dNBR_cal(preNBR,postNBR); //calculate the dNBR
+        try {//used to catch the error so the code doesn't freeze up
+          preArea = areaCalculate(preNBR); //calculate the size of preNBR image in ha
+          postArea = areaCalculate(postNBR);//calculate the size of postNBR image in ha
+          dNBRArea = areaCalculate(dNBR);//calculate the size of dNBR image in ha
+        } catch(e) { //if there is no dNBR for this fire 
+          // feed the 0 as the size of the dNBR
+          dNBR_all_size = ee.Number(0);
+        }
+        var confidence = confidence_cal(dNBR); //calculate the confidence rester of dNBR
+        confidence_all = confidence_all.add(ee.List(confidence));//feeding the calculated confidence raster into this variable (accessing it outside the for loop)
+        var dNBRArea = areaCalculate(dNBR); //calculate the size of the dNBR in ha 
+        dNBR_all = dNBR_all.add(ee.List(dNBR));//feeding the calculated dNBR raster into this variable (accessing it outside the for loop)
+        x =0; //assigning x to 0 as this is the reference iteration
+        var SdNBR = dNBRArea; //renaming the area of the dNBR 
+        var offset_org = dNBR_offset_cal (0,0, CollectionPre, CollectionPost, region,0); //calculating the dNBR offsett 
+        var names= exportIndices(x,preNBR,postNBR,SdNBR); //create the name of the dNBR based on the feed preNBR and postNBR properties 
+        dNBR_names=dNBR_names.add(ee.List(names));//feeding the created name (string) into this variable (accessing it outside the for loop)
+        var RdNBR = RdNBR_cal(preNBR, dNBR); //calculate the RdNBR
+        RdNBR_all = RdNBR_all.add(ee.List(RdNBR)); //feeding the calculated RdNBR raster into this variable (accessing it outside the for loop)
+        var dNBR_EVI =  dNBR_EVI_cal(CollectionPost,0,dNBR); //calculating the dNBR-EVI index 
+        dNBR_EVI_all = dNBR_EVI_all.add(ee.List(dNBR_EVI)); //feeding the calculated dNBR-EVI into this variable (accessing it outside the for loop)
+        var RBR = RBR_cal (preNBR, dNBR);
+        RBR_all = RBR_all.add(ee.List(RBR));
+        offsets_all = offsets_all.add(ee.List(offset_org));
+      } else { //if there is both no preNBR and postNBR, break this loop and go to next fire(i+1)
+        continue;
+      }
+      list_fires = list_fires.add(ee.List(region)); //feeding the fire(original perimeter without buffer) in this variable (accessing it outside the for loop)
+      //based on the area of preNBR,postNBR,original area, and dNBR area--> calculate the condition to test if there is a need for iterations 
+      var con = getCombinedCondition(area, preArea, postArea, dNBRArea); 
+      if ((con.condition).getInfo()){ //if the condition is true, i.e., iteration is needed 
+        if (size_CollectionPre.eq(1).getInfo() || size_CollectionPost.eq(1).getInfo()){ //if there is no image in either of collection, then break the loop and go to next i++
+          print(i+" : Either pre/post collections have only one image.");
+        }
+        var iterated_dNBR = iterationS(con); //based on the condition type/name, choose the iteration function and calculate the iterated dNBR, confidencde, name, and RdNBR
+        var dNBR1 = iterated_dNBR.dNBR; //getting the dNBR out of iteration
+        dNBR_all = dNBR_all.add(ee.List(dNBR1));//feeding dNBR to the variable (accessing it outside the for loop)
+        var names1 =  iterated_dNBR.names; //getting the names of dNBR out of iteration
+        //.........................................................................................//
+        //                                                                                         //
+        //                                                                                         //
+        //                                "For each iteration"                                     //
+        //                                                                                         //
+        //                                                                                         //
+        //.........................................................................................//
+        var L_names1 = names1.length().getInfo(); // get the length of the names1 (it is a list)
+        for (var f=0; f<L_names1; f++) { //for each of the names in the list
+          var N1 = names1.get(f); //get one of the names 
+          N1 = ee.String(N1);
+          var startIndex = ee.String(N1).index('dNBRarea_').add(9); //finding the starting position of iterated dNBR area 
+          var endIndex = ee.String(N1).index('_firearea_'); //finding the ending position of iterated dNBR area 
+          var area_iterated = ee.String(N1).slice(startIndex, endIndex); // Extract the area 
+          area_iterated = ee.Number.parse(area_iterated,10); //Making sure it is a number(Gee optimization)
+          dNBR_all_size1.push(area_iterated.getInfo());//feeding the size of the iterated dNBR 
+        }
+        //************************************************ end of for loop for each iteration 
+        dNBR_names = dNBR_names.add(ee.List(names1));//feeding names to the variable (accessing it outside the for loop)
+        var oofset1 = iterated_dNBR.offset;
+        offsets_all = offsets_all.add(ee.List(oofset1));
+        var confidence1 = iterated_dNBR.confidence; //getting the confidence of dNBR out of iteration
+        confidence_all = confidence_all.add(ee.List(confidence1)); //feeding confidence to the variable (accessing it outside the for loop)
+        var RdNBR1 = iterated_dNBR.RdNBR; //getting the RdNBR out of iteration
+        RdNBR_all = RdNBR_all.add(ee.List(RdNBR1)); //feeding RdNBR to the variable (accessing it outside the for loop)
+        var dNBR_EVI1 = iterated_dNBR.dNBR_EVI;
+        dNBR_EVI_all = dNBR_EVI_all.add(ee.List(dNBR_EVI1));
+        var RBR1 = iterated_dNBR.RBR;
+        RBR_all = RBR_all.add(ee.List(RBR1));
+      } else { //if no iteration is needed, then go to next fire (i++)
+        continue; 
+      }
+    } catch (e) {//used to catch the error so the code doesn't freeze up --> any error go to next i (i++)
+      print('Skipping iteration ' + i + ' for '+year+ ' due to error: ' + e);
+      continue;
+    }
+  }
+  
+  //************************************************ end of for loop for each fire 
+  //..............................//
+  //                              //
+  //                              //
+  //     "AREA Calculation"       //
+  //    "EXPORT": area_info       //
+  //                              //
+  //                              //
+  //..............................//
+  var sum_dnbr = ee.List(dNBR_all_size).reduce(ee.Reducer.sum()); //calculate the sum of areas of dNBR (only 0iteration)
+  // print(sum_dnbr,year +':sum_dnbr'); //printing total area of dNBR (internal check up)
+  var sum_iterations = ee.List(dNBR_all_size1).reduce(ee.Reducer.sum()); //calculate the sum of areas of iterated dNBR
+  // print(sum_iterations,year +':sum_iterations');
+  var sum_area = ee.List(fire_all_size).reduce(ee.Reducer.sum()); //calculate the sum of areas of valid fires 
+  // print(sum_area,year+':sum_area_valid_fires');//printing total area of fires (internal check up)
+  var total_with_dNBR = ee.Number(sum_dnbr).add(sum_iterations);
+  // print(total_with_dNBR,year+':sum_area_with_dNBR');
+  //percentage of area of valid fires 
+  var per_valid_fire_area =  (ee.Number(sum_area).divide(ee.Number(sumValue))).multiply(100).round();
+  // print(per_valid_fire_area,year+'_percentage_valid_fire_area');
+  //percentage of area of all the fires with dNBR estimation 
+  var per_Total_fire_with_dNBR = (ee.Number(total_with_dNBR).divide(ee.Number(sumValue))).multiply(100).round();
+  // print(per_Total_fire_with_dNBR,year+'_percentage_Total_fire_with_dNBR');
+  //percentage of area of valid fires with dNBR estimation 
+  var per_valid_fire_with_dNBR = (ee.Number(total_with_dNBR).divide(ee.Number(sum_area))).multiply(100).round();
+  // print(per_valid_fire_with_dNBR,year+'_percentage_valid_fire_with_dNBR');
+  //creating one list with all the data about the size and area and percenatage 
+  var keys = ee.List(['Year','Sum_all_fires', 'Sum_valid_fires','Sum_dNBR_Ref','Sum_iteration_dNBR','Sum_all_dNBR','percentage_valid_to_all_fires', 'percentage_dNBR_to_all_fires','percentage_dNBR_to_valid_fires']);
+  var values = ee.List([year, sumValue,sum_area,sum_dnbr,sum_iterations,total_with_dNBR,per_valid_fire_area,per_Total_fire_with_dNBR,per_valid_fire_with_dNBR]);
+  var all_about_areas = ee.Dictionary.fromLists(keys, values);//convert the list to dictionary
+  // print(all_about_areas,'all_about_areas');
+  //convert the dictionary to featurecollection to export as a CVS
+  var FC_all_area = ee.FeatureCollection([ 
+    ee.Feature(null, all_about_areas)
+  ]);
+  //exporting info/detail about the areas 
+  // Export.table.toDrive({
+  //   collection: FC_all_area,
+  //   description: 'areas_'+year,
+  //   fileFormat: 'CSV',
+  //   folder: 'areas_specifications_all'
+  // });
+  
+  var areas = ee.FeatureCollection(list_fires).flatten(); //creating a list of fires used for export (as region of export)
+  
+  //..............................//
+  //                              //
+  //                              //
+  //      "EXPORT": dNBR          //
+  //                              //
+  //                              //
+  //..............................//
+  dNBR_all = ee.List([dNBR_all]).filter(ee.Filter.notNull(['item'])); //removing nulls from dNBR list 
+  dNBR_all = ee.List(dNBR_all).flatten(); //one flattened list of dNBR images 
+  var imageCollection_dNBR = ee.ImageCollection.fromImages(dNBR_all); //dNBR list to image collection 
+  var mosaic_dNBR = imageCollection_dNBR.mosaic(); //mosaic all the dNBRs -"last pixel" approach (Last-Pixel Compositing)
+  // print(dNBR_all,'dNBR_all'); //printing the dNBR list (internal check up) 
+  // Map.addLayer(mosaic_dNBR, {}, 'mosaic_dNBR'); //visualize the dNBR mosaic (internal check up) 
+  //exporting the mosaic dNBR image (as an image)
+  // Export.image.toDrive({image:mosaic_dNBR,
+  //   folder:'dNBR_all_maps',
+  //   scale: Scale_all, 
+  //   fileNamePrefix:'dNBR_'+year,
+  //   maxPixels: 1e13,
+  //   crs: "EPSG:32629",
+  //   region: areas,
+  //   fileFormat:'GeoTIFF',
+  //   description:'dNBR_'+year
+  // }); 
+  //..............................//
+  //                              //
+  //                              //
+  //     "EXPORT": RdNBR          //
+  //                              //
+  //                              //
+  //..............................//
+  RdNBR_all = ee.List([RdNBR_all]).filter(ee.Filter.notNull(['item'])); //removing nulls from RdNBR list 
+  RdNBR_all = ee.List(RdNBR_all).flatten(); //one flattened list of RdNBR images 
+  var imageCollection_RdNBR = ee.ImageCollection.fromImages(RdNBR_all);//RdNBR list to image collection 
+  var mosaic_RdNBR = imageCollection_RdNBR.mosaic(); //mosaic all the RdNBRs -"last pixel" approach (Last-Pixel Compositing)
+  // Map.addLayer(mosaic_RdNBR, {}, 'mosaic_RdNBR'); //visualize the RdNBR mosaic (internal check up) 
+  // print(RdNBR_all,'RdNBR_all');//printing the RdNBR list (internal check up) 
+  //exporting the mosaic RdNBR image (as an image)
+  // Export.image.toDrive({image:mosaic_RdNBR,
+  //   folder:'RdNBR_all_maps',
+  //   scale: Scale_all, 
+  //   fileNamePrefix:'RdNBR_'+year,
+  //   maxPixels: 1e13,
+  //   crs: "EPSG:32629",
+  //   region: areas,
+  //   fileFormat:'GeoTIFF',
+  //   description:'RdNBR_'+year
+  // });  
+  
+  //..............................//
+  //                              //
+  //                              //
+  //    "EXPORT": details-names   //
+  //                              //
+  //                              //
+  //..............................//
+  dNBR_names = ee.List([dNBR_names]).filter(ee.Filter.notNull(['item'])); //removing nulls from dNBR names list 
+  dNBR_names = ee.List(dNBR_names).flatten(); //one flattened list of dNBR names
+  // print(dNBR_names,'dNBR_names'); //printing the names list (internal check up)
+  var details = dNBR_names.map(name2dictionary); //converting the details of dNBR to dictionary
+  // print(details,'details')
+  details = details.map(name2FC);
+  var fc_details = ee.FeatureCollection(details);//dictionary of details to featurecollection
+  // print(fc_details,'fc_details')
+  //exporting the details (as a CSV file)
+  // Export.table.toDrive({
+  //   collection: fc_details,
+  //   description: 'burn_severity_details_'+year,
+  //   fileFormat: 'CSV',
+  //   folder: 'burn_severity_details_all' 
+  // });
+  //..............................//
+  //                              //
+  //                              //
+  //    "EXPORT": details-offset  //
+  //                              //
+  //                              //
+  //..............................//
+  offsets_all = ee.List([offsets_all]).filter(ee.Filter.notNull(['item'])); 
+  offsets_all = ee.List(offsets_all).flatten(); 
+  // print(offsets_all,'offsets_all');
+  var details_offsets = offsets_all.map(offsets2dictionary);
+  // print(details_offsets,'details_offsets')
+  details_offsets = details_offsets.map(name2FC);
+  var offset_FC = ee.FeatureCollection(details_offsets);
+  // print(offset_FC,'offset_FC');
+  // Export.table.toDrive({
+  //   collection: offset_FC,
+  //   description: 'offset_details_'+year,
+  //   fileFormat: 'CSV',
+  //   folder: 'offset_details_all' 
+  // });
+  //..............................//
+  //                              //
+  //                              //
+  //    "EXPORT": confidence      //
+  //                              //
+  //                              //
+  //..............................//
+  confidence_all = ee.List([confidence_all]).filter(ee.Filter.notNull(['item'])); //removing nulls from confidence list 
+  confidence_all = ee.List(confidence_all).flatten(); //one flattened list of confidence images 
+  var confidence_collection = ee.ImageCollection.fromImages(confidence_all);//confidence list to image collection 
+  var mosaic_confidence = confidence_collection.mosaic(); //mosaic all the confidence -"last pixel" approach (Last-Pixel Compositing)
+  // Map.addLayer(mosaic_confidence,{},year+':mosaic_confidence');//visualize the confidence mosaic (internal check up) 
+  
+  //exporting the mosaic confidence image (as an image)
+  // Export.image.toDrive({image:mosaic_confidence,
+  //   folder:'confidence_all_maps',
+  //   scale: Scale_all, 
+  //   fileNamePrefix:'confidence_'+year,
+  //   maxPixels: 1e13,
+  //   crs: "EPSG:32629",
+  //   region: areas,
+  //   fileFormat:'GeoTIFF',
+  //   description:'confidence_'+year
+  // });  
+  //..............................//
+  //                              //
+  //                              //
+  //    "EXPORT": dNBR_EVI        //
+  //                              //
+  //                              //
+  //..............................//
+  dNBR_EVI_all = ee.List([dNBR_EVI_all]).filter(ee.Filter.notNull(['item'])); //removing nulls from dNBR_EVI list 
+  dNBR_EVI_all = ee.List(dNBR_EVI_all).flatten(); //one flattened list of dNBR_EVI images 
+  var dNBR_EVI_collection = ee.ImageCollection.fromImages(dNBR_EVI_all); //dNBR_EVI list of images into image collection 
+  var mosaic_dNBR_EVI = dNBR_EVI_collection.mosaic(); //mosaic all dNBR_EVI -"last pixel" approach (Last-Pixel Compositing)
+  // Map.addLayer(mosaic_dNBR_EVI,{},year+':mosaic_dNBR_EVI');//visualize the dNBR_EVI mosaic (internal check up) 
+  //exporting the mosaic dNBR_EVI image (as an image)
+  // Export.image.toDrive({image:mosaic_dNBR_EVI,
+  //   folder:'dNBR_EVI_all_maps',
+  //   scale: Scale_all, 
+  //   fileNamePrefix:'dNBR_EVI_'+year,
+  //   maxPixels: 1e13,
+  //   crs: "EPSG:32629",
+  //   region: areas,
+  //   fileFormat:'GeoTIFF',
+  //   description:'dNBR_EVI_'+year
+  // }); 
+  
+  //..............................//
+  //                              //
+  //                              //
+  //      "EXPORT": RBR           //
+  //                              //
+  //                              //
+  //..............................//
+  RBR_all = ee.List([RBR_all]).filter(ee.Filter.notNull(['item'])); //removing nulls from dNBR_EVI list 
+  RBR_all = ee.List(RBR_all).flatten(); //one flattened list of dNBR_EVI images 
+  var RBR_collection = ee.ImageCollection.fromImages(RBR_all); //dNBR_EVI list of images into image collection 
+  var mosaic_RBR = RBR_collection.mosaic(); //mosaic all dNBR_EVI -"last pixel" approach (Last-Pixel Compositing)
+  // Map.addLayer(mosaic_RBR,{},year+':mosaic_RBR');//visualize the dNBR_EVI mosaic (internal check up) 
+  //exporting the mosaic RBR image (as an image)
+  // Export.image.toDrive({image:mosaic_RBR,
+  //   folder:'RBR_all_maps',
+  //   scale: Scale_all, 
+  //   fileNamePrefix:'RBR_'+year,
+  //   maxPixels: 1e13,
+  //   crs: "EPSG:32629",
+  //   region: areas,
+  //   fileFormat:'GeoTIFF',
+  //   description:'RBR_'+year
+  // }); 
+
+  //..............................//
+  //                              //
+  //                              //
+  //   checkup:size of export     //
+  //        (if needed)           //
+  //                              //
+  //..............................//
+  
+  //calculating the size of the dNBR_mosaic to check if there is any copmression during export
+  // var mosaic_dNBR1 = mosaic_dNBR.clip(areas);
+  // var numPixels = mosaic_dNBR1.reduceRegion({
+  //   reducer: ee.Reducer.count(),
+  //   geometry: areas.geometry(),
+  //   scale: Scale_all, 
+  //   maxPixels: 1e13 
+  // }).getInfo();
+  // numPixels = ee.Dictionary(numPixels).get('NBR');
+  // var sizePerPixel = 4; //the size is float 32
+  // var imageSizeBytes = ee.Number(numPixels).multiply(sizePerPixel);
+  // print('Estimated image size (bytes IN KB):', numPixels.divide(1000));
+  //*********************************** end of exporting 
+  
+//************************************************ end of for loop for each year 
+}
+
+
