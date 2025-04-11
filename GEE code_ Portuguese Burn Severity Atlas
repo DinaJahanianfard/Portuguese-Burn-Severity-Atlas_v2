@@ -32,6 +32,7 @@
 
 //This code is developed by Dina Jahanianfard, ULisboa. 
 //This code can only be used after the publication/citation of the manuscript entitled:"Multidecadal satellite-derived Portuguese Burn Severity Atlas (1984 -2022) ", written by Jahanianfard.D, et al (2024). 
+// link to asset: https://code.earthengine.google.com/?asset=projects/the-name-367619/assets/Wildire_Perimeters_Dates_1984_2022_V6
 //.........................................................................................//
 //                                                                                         //
 //                                                                                         //
@@ -43,7 +44,12 @@
 var start,end,region,area,area_original,x;
 var con1, con2, preNBR, postNBR, dNBR, preArea, postArea, dNBRArea,fire,onlybuffer;
 var Scale_all = ee.Algorithms.If(year === 2012, 500, 30);//defining the scale if MODIS is being used, then 500 and not the scale be 30
-Scale_all = ee.Number(Scale_all).getInfo(); //object type should be number from computed object
+if (year!=2012){
+  Scale_all = 30;
+} else {
+  Scale_all = 500;
+}
+Scale_all = ee.Number(Scale_all).getInfo();
 
 //******************************************************************************************
 
@@ -1291,6 +1297,26 @@ function name2dictionary (item) {
   };
   return dictionary;
 }
+function name2dictionary_before2000 (item) {
+  item = ee.String(item); //get the items off the list and make them into string
+  var parts = item.split("_"); // Split the string by underscore
+  var dictionary = { //get the parts of the string representing the specifications
+    Iteration: parts.get(0),
+    Fire_i: parts.get(2),
+    Year: parts.get(3), 
+    ID: ee.String(parts.get(4)).cat('_').cat(ee.String(parts.get(5))),
+    preTL:parts.get(7),
+    preCC: parts.get(9),
+    preSuitability: parts.get(11),
+    postTL:parts.get(13), 
+    postCC:parts.get(15), 
+    postSuit: parts.get(17), 
+    dNBRarea:parts.get(19), 
+    firearea: parts.get(21), 
+    Confidence: parts.get(23)
+  };
+  return dictionary;
+}
 //converting the calculated offset as a string into a dictionary
 function offsets2dictionary(item){
   item = ee.String(item); //get the items off the list and make them into string
@@ -1320,6 +1346,260 @@ function reformatting_dates(feature) {
   var formattedDate1 = date1.format("yyyy-MM-dd"); //converting milliseconds to yyyy-MM-dd format 
   return feature.set({"Data_ini":formattedDate,"Data_end":formattedDate1});//in the field the formatted version being inserted
 }
+// additional functions to check for fires merging in one and checking fire dates (before 2000)
+// function maskLowValues(image) {
+//   // Define the threshold value
+//   var threshold = -0.001;
+
+//   // Create a mask for pixels with values greater than the threshold across the desired bands
+//   var mask = image.select(['SR_B4', 'SR_B3', 'SR_B2'])
+//                   .reduce(ee.Reducer.min())
+//                   .gt(threshold);
+//   // Apply the mask to the image
+//   return image.updateMask(mask);
+// }
+// function maskHighValues(image) {
+//   // Set the threshold
+//   var threshold = 0.4;
+//   // Create masks for each band
+//   var maskSWIR = image.select('SR_B7').lt(threshold);
+//   var maskNIR = image.select('SR_B3').lt(threshold);
+//   var maskRed = image.select('SR_B2').lt(threshold);
+//   // Combine masks (only keep pixels below threshold in all bands)
+//   var combinedMask = maskSWIR.and(maskNIR).and(maskRed);
+//   // Apply the combined mask to the image
+//   return image.updateMask(combinedMask);
+// }
+// function new_properties (ic){
+//   var dates_images,date_imageT; //variables to get the dates either from MODIS or LANDSAT 
+//   var fire_area = area; //original area of the fire reported in the shapefile (Tables)
+//   // TIMELAG : 
+//   if ( year!=2012 ){
+//     dates_images = ee.ImageCollection(ic).aggregate_first("DATE_ACQUIRED"); //getting the acqusition date of image (MODIS)
+//     date_imageT = ee.Date(dates_images); //converting to readable date by GEE
+//   } else if (year===2012){
+//     dates_images= ee.ImageCollection(ic).aggregate_first("system:index"); //getting the acqusition date of image (Landsat)
+//     date_imageT = ee.Date.parse('yyyy_MM_dd',dates_images, 'GMT'); //converting to readable date by GEE
+//   }
+//   var dateImage = ee.Array(date_imageT.millis()); //converting the acqusition date of image into milliseconds 
+//   var start_array = ee.Array(start.millis()); //  converting the start date of the fire to milliseconds (start will be taken from the shapefile)
+//   var diff_Fire_Image = ee.Number(dateImage).subtract(ee.Number(start_array));  //subtracting the start date of fire from the acqusition date of image (=time lag or TL)
+//   var diff2date = diff_Fire_Image.divide(86400000).int(); //converting TL from milliseconds to integer number 
+//   //CLOUDs
+//   var cloudless_img = ee.ImageCollection(ic).map(maskClouds).first().clip(region); // getting each image, applying cloud mask and clipping it to AOI
+//   var cloudless_img_pixel_count = areaCalculate(cloudless_img); //getting the size in ha of clipped cloudfree image
+//   var img_full = ee.ImageCollection(ic).first().clip(region); // getting each image and clipping it to AOI 
+//   var img_pixel_count = areaCalculate(img_full); //getting the size in ha of clipped image (with cloud)
+//   //CLOUD_COVERAGE_AOI
+//   var cloud_percentage_aoi = (ee.Number(1).subtract(cloudless_img_pixel_count.divide(img_pixel_count)).multiply(100)).round(); //getting the percentage of cloud within the AOI
+//   //IMAGE_COVERAGE_PERCENTAGE 
+//   var image_covereage = ((img_pixel_count.divide(fire_area)).multiply(100)).round(); //percentage of image actually covering the AOI 
+//   return ic.set({'TIMELAG':diff2date,'CLOUD_COVERAGE_AOI': cloud_percentage_aoi,'IMAGE_COVERAGE_PERCENTAGE':image_covereage}); //inserting the new properties into meta data of the pre-fire image collection
+// }
+// function classifyImage(image) {
+//   // Select the SWIR (SR_B7) and NIR (SR_B4) bands
+//   var swir = image.select('SR_B7');
+//   var nir = image.select('SR_B4');
+  
+//   var swirGreaterThanNir = swir.gt(nir);
+//   var nirGreaterThanSwir = nir.gt(swir);
+//   // Calculate the percentage of pixels where SWIR > NIR and NIR > SWIR
+//   var swirCount = swirGreaterThanNir.reduceRegion({
+//     reducer: ee.Reducer.sum(),
+//     geometry: image.geometry(),
+//     scale: 30,
+//     maxPixels: 1e8
+//   });
+//   var nirCount = nirGreaterThanSwir.reduceRegion({
+//     reducer: ee.Reducer.sum(),
+//     geometry: image.geometry(),
+//     scale: 30,
+//     maxPixels: 1e8
+//   });
+//   // Get the total pixel count for the image
+//   var totalPixelCount = image.select('SR_B7').reduceRegion({
+//     reducer: ee.Reducer.count(),
+//     geometry: image.geometry(),
+//     scale: 30,
+//     maxPixels: 1e8
+//   });
+//   // Compute percentages
+//   var swirPercent = ee.Number(swirCount.get('SR_B7')).divide(totalPixelCount.get('SR_B7')).multiply(100);
+//   var nirPercent = ee.Number(nirCount.get('SR_B4')).divide(totalPixelCount.get('SR_B7')).multiply(100);
+//   // Determine classification based on majority pixel comparison
+//   var classification = ee.Algorithms.If(
+//     swirPercent.gt(nirPercent), // Condition
+//     1,0) // 1=burned, 0= unburned
+//   return classification;
+// }
+// function extent_check(img,imgBefore,featureCollection){ //differnce
+//   function calculateNBR(image) {
+//     return image.normalizedDifference(['SR_B4', 'SR_B7']).rename('NBR');
+//   }
+//   // NBR of pre-fire image
+//   var nbrBefore = calculateNBR(imgBefore).clip(featureCollection);
+//   //NBR of post-fire image
+//   var nbrAfter = calculateNBR(img).clip(featureCollection);
+//   //dNBR calculation
+//   var dNBR = nbrBefore.subtract(nbrAfter).rename('dNBR');
+//   // thershold for distinguishing burned and unburned
+//   var t4 = dNBR.lte(0.1);
+//   //masking only burned 
+//   var mask = t4.not();
+//   // Map.addLayer(mask,{bands: ['dNBR', 'dNBR', 'dNBR'], min:0, max: 0.3},'mask');
+//   //masking only burned
+//   var burned =img.updateMask(mask);
+//   //masking unburned 
+//   var not_burned = img.updateMask(t4);
+//   // Map.addLayer(not_burned, {bands: ['SR_B7', 'SR_B4', 'SR_B3'], min:0, max: 0.3},'not_burned');
+//   //convert the unburned to vector/polygon/multipolygon
+//   var maskedGeometry = t4.reduceToVectors({
+//     reducer: ee.Reducer.countEvery(),
+//     geometryType: 'polygon',
+//     scale: 30,
+//     bestEffort: true
+//   });
+//   // Map.addLayer(maskedGeometry,{},'maskedGeometry')
+//   // print(maskedGeometry,'maskedGeometry')
+//   //getting the largest multipolygon
+//   var filteredGeometry = maskedGeometry//.filter(ee.Filter.eq('label', 1));
+//   var maskedGeometryWithArea = filteredGeometry.map(function(feature) {
+//     return feature.set('area', feature.geometry().area(1));
+//   });
+//   var sortedGeometry = maskedGeometryWithArea.sort('area', false);
+//   // Select the largest polygon
+//   var largestPolygon = sortedGeometry.first();
+//   var mergedGeometry = ee.Feature(largestPolygon);//.union(1); // (adding union if necessary)
+//   //visualization for internal check up if needed 
+//   var empty = ee.Image().byte(); //creating the empty space to create the border of the fire for visualization purposed (internal check up)
+//   var outline = empty.paint({ //creating the fire border 
+//     featureCollection: mergedGeometry,
+//     color: 1,
+//     width: 4
+//   });
+//   // Map.addLayer(outline,{palette: '0000FF'},'new_region');
+//   //calculate the unburned area
+//   var area_not_burned = areaCalculate((imgBefore).clip(mergedGeometry));
+//   return {con:area_not_burned, 
+//           Feat:mergedGeometry}
+// }
+// function firescar(image){
+//   var SWIR = image.select('SR_B7');
+//   var NIR = image.select('SR_B4');
+//   var RED = image.select('SR_B3');
+//   var fireScarCondition  = SWIR.gt(0.1).and(NIR.lt(0.1)).and(RED.lt(0.1));
+//   var firescarCount = fireScarCondition.reduceRegion({
+//     reducer: ee.Reducer.sum(),
+//     geometry: image.geometry(),
+//     scale: 30,
+//     maxPixels: 1e8
+//   });
+//   var totalPixelCount = image.select('SR_B7').reduceRegion({
+//     reducer: ee.Reducer.count(),
+//     geometry: image.geometry(),
+//     scale: 30,
+//     maxPixels: 1e8
+//   });
+//   var firescarPercent = ee.Number(firescarCount.get('SR_B7')).divide(totalPixelCount.get('SR_B7')).multiply(100);
+//   var classification = ee.Algorithms.If(firescarPercent.gt(0),1,0);
+//   return classification;
+// }
+// function analyzeFeature(inputFeature, imageCollection) {
+//     // Step 1: Get the feature collection
+//     var featureCollection = ee.FeatureCollection(inputFeature).first();
+//     // get the fire ID
+//     var ID1 = ee.String(featureCollection.get('new_ID'));
+//     // print(ID1,'ID1')
+//     // print(featureCollection,'featureCollection')
+//     // Step 2: Get the property "Date_D" from the input feature
+//     var dateD =ee.String(featureCollection.get('Date_D')); //'1985-11-14'//
+//     // print(dateD,'dateD')
+//     // Step 3: Filter the image collection based on the region and date range
+//     var start = ee.Date.parse('yyyy-MM-dd',dateD, 'GMT');
+//     var startDate = start.advance(-100, 'days');
+//     var endDate = start.advance(100, 'day'); // Include the image on Date_D
+//     var filteredImages = imageCollection
+//         .filterBounds(inputFeature)//.geometry())
+//         .filterDate(startDate, endDate)
+//         .map(new_properties);
+//     // filter the IC based on the properties of cloud within AOI and image coverage
+//     filteredImages = filteredImages.filterMetadata('IMAGE_COVERAGE_PERCENTAGE','greater_than',35);
+//     filteredImages = filteredImages.filterMetadata('CLOUD_COVERAGE_AOI','less_than',90);
+//     // add duration to increase the number of images available after filterartion of properties
+//     var imageOnDateD = filteredImages.filterDate(start, start.advance(100, 'day')).first();
+//     // Map.addLayer(imageOnDateD, {bands: ['SR_B7', 'SR_B4', 'SR_B3'], min:0, max: 0.3},'imageOnDateD');
+//     // Internal check up, if needed, to compare "Date_D" and image acquire date
+//     var img_D = imageOnDateD.get('DATE_ACQUIRED');
+//     // print(img_D,'imageOnDateD');
+//     // print(imageOnDateD,'imageOnDateD')
+//     // Get the image before Date_D
+//     var imageBeforeDateD = filteredImages
+//         .filterDate(startDate, start)
+//         .sort('system:time_start', false)
+//         .first();
+//     // print(imageBeforeDateD,'imageBeforeDateD');
+//     // Map.addLayer(imageBeforeDateD, {bands: ['SR_B7', 'SR_B4', 'SR_B3'], min:0, max: 0.3},'imageBeforeDateD');
+//     //internal check up to compare dates 
+//     var img_D1 = imageBeforeDateD.get('DATE_ACQUIRED');
+//     // print(img_D1,'imageBeforeDateD');
+//     // print(imageBeforeDateD,'imageBeforeDateD')
+//     // Check if both images exist 
+//     if (imageBeforeDateD.getInfo()===null || imageOnDateD.getInfo()===null ) {
+//         print('Missing images for feature with new_ID:', ID1);
+//         return {feat:inputFeature,
+//               cons:0};
+//     } else {
+//       // Map.addLayer(region,{},'region')
+//       // Map.addLayer(inputFeature,{},'inputFeature')
+//       var con_img = classifyImage(imageOnDateD.clip(region));
+//       // print(con_img,'image on date');
+//       var con_imgBefore = classifyImage(imageBeforeDateD.clip(region));
+//       var firescar_pre = firescar(imageBeforeDateD.clip(region))
+//       // print(firescar_pre,'firescar_pre');
+//       var firescar_post = firescar(imageOnDateD.clip(region))
+//       // print(firescar_post,'firescar_post')
+//       var multiple_fire = extent_check(imageOnDateD,imageBeforeDateD,inputFeature);
+//       // print(multiple_fire,'multiple_fire_'+i);
+//       // Map.addLayer(multiple_fire.Feat,{},'processed')
+//       var con_pre = ee.Algorithms.If(ee.Number(firescar_pre).eq(1).and(ee.Number(multiple_fire.con).gte(100)),1,0);
+//       if ((firescar_post.getInfo() ==1 || con_img.getInfo() ==1 ) && (firescar_pre.getInfo() ===0 || con_pre.getInfo() ==1) ){
+//         // print('Passed (Burned):',ID1);
+//         // var multiple_fire = extent_check(imageOnDateD,imageBeforeDateD,inputFeature);
+//         // print(multiple_fire,'multiple_fire');
+//         var difference_fires = multiple_fire.con;
+//         if (difference_fires.getInfo()>= 100){
+//           var new_polygon = multiple_fire.Feat; 
+//           // print(new_polygon,'new_polygon')
+//           // Map.addLayer(new_polygon,{},'new_polygon')
+//           // var newPolygon = refeature(inputFeature,new_polygon);
+//           // Map.addLayer(newPolygon,{},'newPolygon')
+//           // var newPolygon1 = refeature1(inputFeature,new_polygon,imageOnDateD);
+//           // print(newPolygon1,'newPolygon')
+//           var area_diff = areaCalculate(imageOnDateD.clip(new_polygon));
+//           // print(area_diff,'area_diff'+i)
+//           // print(area_diff,'area_diff')
+//           // return {feat:new_polygon,
+//           //     cons:1};
+//           if (area_diff.getInfo()>= 100){
+//             var newPolygon = ee.Feature(new_polygon)
+//             // Map.addLayer(newPolygon,{},'newPolygon')
+//             return {feat:newPolygon,
+//               cons:1};
+//           } else {
+//             return {feat:inputFeature,
+//               cons:1};
+//           }
+//         } else {
+//           return {feat:inputFeature,
+//               cons:1};
+//         }
+//       } else {
+//         // print('Failed:',ID1);
+//         return {feat:inputFeature,
+//               cons:0};
+//       }
+//     }
+// }
 
 //******************************************************************************************
 
@@ -1346,15 +1626,11 @@ for (var year = 1984; year <= 2022; year++) {
   var confidence_all=ee.List([]);
   var RBR_all = ee.List([]);
   var offsets_all = ee.List([]);
-  if (year> 2000){ //table = shapefile of fires from 2001 to 2022
-    fc = (table);
-  } else if (year<=2000){
-    fc = (table2); //table2 = shapefile of fires from 1984 to 2000
-    fc = ee.FeatureCollection(fc).map(reformatting_dates); // the dates in this shapefile are in the format of milliseconds, and now they are converted into yyyy-MM-dd format
-  }
+  fc = (table);
   var FC1 = ee.FeatureCollection(fc); //converting the table into featurecollection
-  FC1 = FC1.filter(ee.Filter.eq('Year', year)); //filtering the shapefile based on the year 
-  var columnToSum = "area_ha";//getting the column containing the size of each fire(ha)
+  // FC1 = FC1.filter(ee.Filter.eq('Year', year)); //filtering the shapefile based on the year 
+  FC1 = FC1.filter(ee.Filter.eq('Year', year.toString()));
+  var columnToSum = "Area_ha";//getting the column containing the size of each fire(ha)
   // Calculate the sum of the areas
   var sum = FC1.reduceColumns({
     reducer: ee.Reducer.sum(),
@@ -1363,14 +1639,9 @@ for (var year = 1984; year <= 2022; year++) {
   // Get the sum of burnt area (allburnt areas)
   var sumValue = sum.get('sum');
   // print(sumValue,year +':sum_total_area'); //printing the total area(internal checkup)
-  fc = fc.filter(ee.Filter.greaterThanOrEquals("area_ha",100)); //area_ha = the propertry of fire size in ha in the shapefile (column in the atribute table),filtering fires larger than 100ha 
+  fc = fc.filter(ee.Filter.greaterThanOrEquals("Area_ha",100)); //area_ha = the propertry of fire size in ha in the shapefile (column in the atribute table),filtering fires larger than 100ha 
   //valid fires 
-  fc = fc.filter(ee.Filter.eq('Year', year)); //filtering the shapefile based on the year 
-  // fc = fc.filter(ee.Filter.eq('ID', '0585')); //filtering the shapefile based on the year 
-  fc = fc.filter(ee.Filter.neq("Data_ini",'')); //filtering the shapefile based on the start date of the fire
-  fc = fc.filter(ee.Filter.neq("Data_end",'')); //filtering the shapefile based on the end date of the fire
-  fc = fc.filter(ee.Filter.neq("Data_ini",'NaN')); //filtering the shapefile based on the fires with no start dates
-  fc = fc.filter(ee.Filter.neq("Data_end",'NaN')); //filtering the shapefile based on the fires with no start dates
+  fc = fc.filter(ee.Filter.eq('Year', year.toString())); 
   var ic_pre; // imagecollection to feed the pre-fire images
   var ic_post;// imagecollection to feed the post-fire images
   var size_fc =fc.size().getInfo(); //the size of the filtered shapefile (filtered to only valid fires with start and end date, the fire size,and fire year)
@@ -1392,19 +1663,47 @@ for (var year = 1984; year <= 2022; year++) {
       color: 1,
       width: 4
     });
-    var start_date,start_firewithone,end_date,endwithmargin,post_date,pre_date,id,area_original; //variables which alter based on the fire year within the if statements 
-    start_date = ee.String(fire.get('Data_ini')); //get the start date 
-    start = ee.Date.parse('yyyy-MM-dd',start_date, 'GMT'); //parse the date into a readable format by GEE
-    start_firewithone = start.advance(-1, 'day'); //to prevent capturing the image while the fire is burning(nontheless the start hour of the fire)-->applying one day( one day before start date)
-    pre_date = start.advance(-110, 'day'); // the duration before the start date (period window) to look for pre-fire images
-    end_date = ee.String(fire.get('Data_end')); //getting the end date of the fire 
-    end = ee.Date.parse('yyyy-MM-dd',end_date, 'GMT'); //parse the date into a readable format by GEE
-    endwithmargin = end.advance(3,'day'); //to prevent capturing the image while the fire is burning(nontheless the end hour of the fire) & preventing the capture of smoke -->applying 3 days( 3days after end date)
-    post_date = end.advance(110, 'day'); // the duration after the end date (period window) to look for post-fire images
-    id = ee.String(fire.get('ID')); //getting the fire ID from the shapefile
-    area = fire.get("area_ha"); //getting the size of the fire in ha from the shapefile
-    area_original = fire.get("area_ha"); //renaming it to have the original size for further comparison reasons 
-    fire_all_size [i] = area_original; //feeding the original size of the valid fire into one variable 
+    if (year <=2000) {
+      var start_date,start_firewithone,end_date,endwithmargin,post_date,pre_date,id,area_original; //variables which alter based on the fire year within the if statements 
+      start_date = ee.String(fire.get('Date_D')); //get the start date 
+      // print(start_date,'start_date')
+      start = ee.Date.parse('yyyy-MM-dd',start_date, 'GMT'); //parse the date into a readable format by GEE
+      start_firewithone = start.advance(-5, 'day'); //to prevent capturing the image while the fire is burning(nontheless the start hour of the fire)-->applying one day( one day before start date)
+      // print(start_firewithone,'start_firewithone')
+      pre_date = start_firewithone.advance(-110, 'day'); // the duration before the start date (period window) to look for pre-fire images
+      end_date = ee.String(fire.get('Date_D')); //getting the end date of the fire 
+      end = ee.Date.parse('yyyy-MM-dd',end_date, 'GMT'); //parse the date into a readable format by GEE
+      endwithmargin = end.advance(-5,'day'); //to prevent capturing the image while the fire is burning(nontheless the end hour of the fire) & preventing the capture of smoke -->applying 3 days( 3days after end date)
+      // print(endwithmargin,'endwithmargin')
+      post_date = endwithmargin.advance(110, 'day'); // the duration after the end date (period window) to look for post-fire images
+      // print(post_date,'post_date')
+      id = ee.String(fire.get('new_ID')); //getting the fire ID from the shapefile
+      // print(id,'ID')
+      area = fire.get("Area_ha"); //getting the size of the fire in ha from the shapefile
+      area = ee.Number.parse(area).int()
+      // print(area,'area')
+      area_original = fire.get("Area_ha"); //renaming it to have the original size for further comparison reasons 
+      area_original = ee.Number.parse(area_original).int()
+      fire_all_size [i] = area_original; //feeding the original size of the valid fire into one variable 
+    } else {
+      var start_date,start_firewithone,end_date,endwithmargin,post_date,pre_date,id,area_original; //variables which alter based on the fire year within the if statements 
+      start_date = ee.String(fire.get('Data_ini')); //get the start date 
+      // print(start_date,'start_date')
+      start = ee.Date.parse('yyyy-MM-dd',start_date, 'GMT'); //parse the date into a readable format by GEE
+      start_firewithone = start.advance(-1, 'day'); //to prevent capturing the image while the fire is burning(nontheless the start hour of the fire)-->applying one day( one day before start date)
+      pre_date = start.advance(-110, 'day'); // the duration before the start date (period window) to look for pre-fire images
+      end_date = ee.String(fire.get('Data_end')); //getting the end date of the fire 
+      end = ee.Date.parse('yyyy-MM-dd',end_date, 'GMT'); //parse the date into a readable format by GEE
+      endwithmargin = end.advance(3,'day'); //to prevent capturing the image while the fire is burning(nontheless the end hour of the fire) & preventing the capture of smoke -->applying 3 days( 3days after end date)
+      post_date = end.advance(110, 'day'); // the duration after the end date (period window) to look for post-fire images
+      id = ee.String(fire.get('ID')); //getting the fire ID from the shapefile
+      area = fire.get("Area_ha"); //getting the size of the fire in ha from the shapefile
+      area = ee.Number.parse(area).int()
+      // print(area,'area')
+      area_original = fire.get("Area_ha"); //renaming it to have the original size for further comparison reasons 
+      area_original = ee.Number.parse(area_original).int()
+      fire_all_size [i] = area_original; //feeding the original size of the valid fire into one variable 
+    }
     //pre-fire image collection
     var criteriaPre = ee.Filter.and( //filtering criteria based on the start date and period window to look for pre-fire images 
       ee.Filter.bounds(region), ee.Filter.date(pre_date, start_firewithone));
